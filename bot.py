@@ -113,7 +113,7 @@ def allowed(ws,day,start,end):
 
 async def prompt(m,state,action,text,**data):
     await state.set_state(Form.text); await state.set_data(dict(action=action,**data))
-    await m.answer(text+'\n/start — выйти в меню.')
+    await m.answer(text+'\nИспользуйте кнопки «Назад», «Отмена» или «Главное меню».',reply_markup=NAV)
 async def home(m,uid,state):
     await state.clear()
     rows=[[('Записаться','book')],[('Мои записи','my')]]
@@ -187,7 +187,7 @@ def staff_buttons(b):
 async def confirm(m,state):
     d=await state.get_data(); s=await service_for(d)
     if not s:return await m.answer('Запись недоступна. /start')
-    p=await master(s['master'])
+    p=await sql('SELECT * FROM masters WHERE id=?',(s['master'],),True)
     await state.set_state(None); await state.update_data(action='confirm')
     await m.answer(f"Подтвердите запись:\n{p['name']} · {s['name']} · {s['minutes']} мин\nЦена: {s['price']+' ₽' if s['price'] else 'не указана'}\n{fmt(d['time'])} МСК\n{d['name']} · {d['phone']}\n\nДанные передаются салону для оформления записи. /privacy",reply_markup=kb([[('Подтвердить','confirm')],[('В меню','home')]]))
 async def save(uid,d):
@@ -202,7 +202,11 @@ async def save(uid,d):
         else:
             s=await (await c.execute('SELECT * FROM services WHERE id=? AND active=1',(d['sid'],))).fetchone()
             if not s:raise ValueError('Услуга недоступна.')
-        if d.get('manual') and uid not in (s['master'],MANAGER):raise ValueError('Нет прав.')
+        enabled_row=await (await c.execute('SELECT enabled FROM masters WHERE id=?',(s['master'],))).fetchone()
+        active_master=bool(enabled_row and enabled_row['enabled'])
+        if not old and not active_master:raise ValueError('Мастер недоступен для новых записей.')
+        if old and uid!=MANAGER and uid!=old['client'] and not active_master:raise ValueError('Права мастера отозваны.')
+        if d.get('manual') and uid!=MANAGER and (uid!=s['master'] or not active_master):raise ValueError('Нет прав.')
         t=d['time']; end=t+s['minutes']*60; day=datetime.fromtimestamp(t,TZ).date()
         if t<=ts() or day>now().date()+timedelta(days=365):raise ValueError('Выберите будущую дату в пределах года.')
         if not allowed(await intervals(c,s['master'],day),day,t,end):raise ValueError('График изменился. Выберите время заново.')
@@ -434,7 +438,6 @@ async def dispatch(m,uid,k,state):
             await sql('INSERT OR REPLACE INTO v2_schedule VALUES(?,?,?)',(uid,target,json.dumps(ws)))
         await target_menu(m,state,uid,target);return await conflicts(m,uid)
 
-@dp.message(Form.text)
 async def input_text(m:Message,state:FSMContext):
     d=await state.get_data();action=d.get('action');uid=m.from_user.id;text=(m.text or '').strip()
     try:
@@ -473,7 +476,6 @@ async def input_text(m:Message,state:FSMContext):
         await state.clear();await m.answer('Сохранено. /start — меню.')
     except (ValueError,OverflowError) as e:await m.answer('Проверьте ввод: '+str(e)+'\nПовторите или /start.')
 
-@dp.message()
 async def fallback(m:Message):await m.answer('Главное меню: /start. Ваш ID: /id.')
 
 async def reminders():
@@ -512,4 +514,458 @@ async def main():
         for job in jobs:
             with contextlib.suppress(asyncio.CancelledError):await job
         await bot.session.close()
+
+# ---- Salon v3 extension: compatible with the supplied version 2 ----
+import calendar
+import secrets
+from aiogram import F
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+NAV=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='Главное меню'),KeyboardButton(text='Назад'),KeyboardButton(text='Отмена')]],resize_keyboard=True,is_persistent=True)
+_initialize2=initialize
+_dispatch2=dispatch
+_input2=input_text
+_save2=save
+_details2=details
+_staffbuttons2=staff_buttons
+_target2=target_menu
+_clock2=clock
+_schedule2=schedule_menu
+_confirm2=confirm
+_selectservices2=select_services
+
+async def initialize():
+    await _initialize2()
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        await c.execute('BEGIN IMMEDIATE')
+        cols=[x[1] for x in await (await c.execute('PRAGMA table_info(masters)')).fetchall()]
+        if 'enabled' not in cols:await c.execute('ALTER TABLE masters ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
+        await c.commit()
+
+async def master(uid):
+    return await sql('SELECT * FROM masters WHERE id=? AND enabled=1',(uid,),True)
+
+async def ready(mid):
+    p=await master(mid)
+    if not p:return False,False,False
+    service=await sql('SELECT id FROM services WHERE master=? AND active=1 LIMIT 1',(mid,),True)
+    rows=await sql('SELECT * FROM v2_schedule WHERE master=?',(mid,))
+    schedule=any(unpack(r['intervals']) and (r['target'].startswith('w:') or r['target'][2:]>=now().date().isoformat()) for r in rows)
+    return bool(p['name'].strip()),bool(service),schedule
+
+async def home(m,uid,state):
+    await state.clear()
+    p=await master(uid)
+    title='CRM Салона' if p or uid==MANAGER else 'Запись к мастеру'
+    await m.answer(title,reply_markup=NAV)
+    rows=[[('Записаться','book'),('Мои записи','my')]]
+    if p:rows.append([('Кабинет мастера','staff')])
+    if uid==MANAGER:rows.append([('Управление салоном','manager')])
+    await m.answer('Выберите действие:',reply_markup=kb(rows))
+
+async def select_masters(m,state,manual=False):
+    await state.clear();await state.update_data(manual=manual)
+    items=[]
+    for p in await sql('SELECT * FROM masters WHERE enabled=1 ORDER BY name'):
+        if all(await ready(p['id'])):items.append(p)
+    if not items:return await m.answer('Пока нет мастеров, готовых к записи.',reply_markup=kb([[('Главное меню','home')]]))
+    for i in range(0,len(items),30):
+        await m.answer('Выберите мастера:',reply_markup=kb([[(p['name'],f"master:{p['id']}")] for p in items[i:i+30]]))
+
+async def select_services(m,state,mid):
+    if not await master(mid):return await m.answer('Мастер сейчас недоступен для новых записей.')
+    await _selectservices2(m,state,mid)
+
+async def save(uid,d):
+    # Final active-role checks are also added inside the original transaction.
+    return await _save2(uid,d)
+
+def details(b):
+    return _details2(b)+f"\nПродолжительность: {(b['end']-b['start'])//60} мин"
+
+def staff_buttons(b):
+    old=_staffbuttons2(b)
+    rows=[] if old is None else list(old.inline_keyboard)
+    rows.append([InlineKeyboardButton(text='Имя и телефон',callback_data=f"v3:contacts:{b['id']}")])
+    rows.append([InlineKeyboardButton(text='Записать повторно',callback_data=f"v3:repeat:{b['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def access_booking(uid,b,staff=False):
+    if not b:return False
+    if uid==MANAGER:return True
+    if uid==b['master'] and await master(uid):return True
+    return not staff and uid==b['client']
+
+async def card(m,uid,bid):
+    b=await sql('SELECT b.*,m.name AS master_name FROM bookings b JOIN masters m ON m.id=b.master WHERE b.id=?',(bid,),True)
+    if not await access_booking(uid,b):raise ValueError('Нет доступа к записи.')
+    markup=staff_buttons(b) if await access_booking(uid,b,True) else client_buttons(b)
+    await m.answer('Мастер: '+b['master_name']+'\n'+details(b),reply_markup=markup)
+
+async def cabinet(m,uid,state,kind):
+    if kind=='manager' and uid!=MANAGER:return
+    if kind=='staff' and not await master(uid):return
+    await state.clear()
+    if kind=='manager':
+        rows=[[('Мастера','v3:masters'),('Выдать права','grant')],[('Записать клиента','manual_all')]]
+    else:
+        rows=[[('Профиль','profile'),('Услуги','services')],[('Расписание','schedule'),('Записать клиента','manual_self')],[('Проверка готовности','v3:ready')]]
+    rows += [[('Сегодня',f'list:{kind}:today'),('Завтра',f'list:{kind}:tomorrow')],[('7 дней',f'list:{kind}:week'),('30 дней',f'list:{kind}:month')],[('Все предстоящие',f'list:{kind}:all')],[('История',f'v3:history:{kind}:0'),('Поиск клиента','v3:search')],[('Главное меню','home')]]
+    await m.answer('CRM Салона',reply_markup=kb(rows))
+
+async def readiness(m,mid):
+    flags=await ready(mid)
+    names=['Профиль заполнен','Услуги добавлены','Расписание задано']
+    await m.answer('\n'.join(('✅ ' if flag else '❌ ')+name for flag,name in zip(flags,names)),reply_markup=kb([[('Профиль','profile'),('Услуги','services')],[('Расписание','schedule'),('В кабинет','staff')]]))
+
+async def master_card(m,mid):
+    p=await sql('SELECT * FROM masters WHERE id=?',(mid,),True)
+    if not p:raise ValueError('Мастер не найден.')
+    flags=await ready(mid)
+    count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND start>?",(mid,ts()),True)
+    near=await sql("SELECT start FROM bookings WHERE master=? AND status='active' AND start>? ORDER BY start LIMIT 1",(mid,ts()),True)
+    text=f"Мастер: {p['name'] or 'Профиль не заполнен'}\nID: {mid}\n{p['bio']}\nПрава: {'активны' if p['enabled'] else 'отозваны'}\nПредстоящих записей: {count['n']}\nБлижайшая: {fmt(near['start']) if near else 'нет'}"
+    if p['enabled']:text+='\nГотовность: '+('готов к записи' if all(flags) else 'нужно завершить настройку')
+    rows=[[('Записи',f'v3:masterbook:{mid}:0'),('Расписание',f'v3:masterschedule:{mid}')]]
+    if p['enabled']:rows.append([('Записать клиента',f'v3:manual:{mid}')])
+    rows.extend([[('Отозвать права' if p['enabled'] else 'Восстановить права',f"v3:right:{mid}:{0 if p['enabled'] else 1}")],[('Все мастера','v3:masters')]])
+    await m.answer(text,reply_markup=kb(rows))
+
+async def history(m,uid,state,scope,page=0):
+    if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+    filters=[];args=[]
+    if uid!=MANAGER:filters.append('b.master=?');args.append(uid)
+    if scope.startswith('master-'):
+        if uid!=MANAGER:raise ValueError('Нет доступа.')
+        filters.append('b.master=?');args.append(int(scope[7:]))
+    elif scope=='search':
+        d=await state.get_data();term=d.get('search','')
+        if not term:raise ValueError('Повторите поиск.')
+        # Literal substring match: SQL wildcards in names have no special meaning.
+        filters.append('(instr(lower(b.name),lower(?))>0 OR instr(b.phone,?)>0)');args.extend([term,term])
+    base=' FROM bookings b JOIN masters m ON m.id=b.master'+(' WHERE '+' AND '.join(filters) if filters else '')
+    count=await sql('SELECT COUNT(*) AS n'+base,args,True)
+    page=max(0,page)
+    rows=await sql('SELECT b.*,m.name AS master_name'+base+' ORDER BY b.start DESC LIMIT 8 OFFSET ?',args+[page*8])
+    await m.answer(f"Найдено: {count['n']}. Страница {page+1}.")
+    for b in rows:
+        await m.answer('Мастер: '+b['master_name']+'\n'+details(b),reply_markup=staff_buttons(b));await asyncio.sleep(.06)
+    buttons=[]
+    if page:buttons.append(('←',f'v3:history:{scope}:{page-1}'))
+    if (page+1)*8<count['n']:buttons.append(('→',f'v3:history:{scope}:{page+1}'))
+    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid==MANAGER else 'staff')]]))
+
+async def availability(s,day,move=0):
+    async with aiosqlite.connect(DB) as c:ws=await intervals(c,s['master'],day)
+    if not ws:return 'off'
+    left=int(datetime.combine(day,time.min,TZ).timestamp());right=left+86400
+    busy=await sql("SELECT start,end FROM bookings WHERE master=? AND status='active' AND start<? AND end>? AND id<>?",(s['master'],right,left,move))
+    busy+=await sql('SELECT start,end FROM v2_blocks WHERE master=? AND start<? AND end>?',(s['master'],right,left))
+    for w in ws:
+        a,b=bounds(w,day)
+        for t in range(a,b,w[2]*60):
+            end=t+s['minutes']*60
+            if t>ts() and end<=b and not any(t<x['end'] and end>x['start'] for x in busy):return 'free'
+    return 'full'
+
+async def dates(m,state):
+    await state.set_state(Form.text);await state.update_data(action='date')
+    await calendar_view(m,state,now().year,now().month)
+
+async def calendar_view(m,state,year,month):
+    first=now().date().replace(day=1);last=(now().date()+timedelta(days=365)).replace(day=1)
+    selected=datetime(year,month,1).date()
+    if not first<=selected<=last:raise ValueError('Выберите месяц в пределах ближайшего года.')
+    d=await state.get_data();s=await service_for(d)
+    if not s:raise ValueError('Выберите услугу заново.')
+    await state.set_state(Form.text);await state.update_data(action='date')
+    names=['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь']
+    rows=[[(x,'v3:noop') for x in ['Пн','Вт','Ср','Чт','Пт','Сб','Вс']]]
+    for week in calendar.monthcalendar(year,month):
+        cells=[]
+        for n in week:
+            if not n:cells.append(('·','v3:noop'));continue
+            day=datetime(year,month,n).date()
+            if not now().date()<=day<=now().date()+timedelta(days=365):cells.append(('—','v3:noop'));continue
+            status=await availability(s,day,d.get('move',0))
+            label=str(n) if status=='free' else ('×' if status=='off' else '•')+str(n)
+            cells.append((label,'v3:date:'+day.isoformat()))
+        rows.append(cells)
+    nav=[]
+    prev=(selected-timedelta(days=1)).replace(day=1);nxt=(selected+timedelta(days=32)).replace(day=1)
+    if prev>=first:nav.append(('←',f'v3:calendar:{prev.year}:{prev.month}'))
+    if nxt<=last:nav.append(('→',f'v3:calendar:{nxt.year}:{nxt.month}'))
+    if nav:rows.append(nav)
+    rows += [[('Сегодня','day:0'),('Завтра','day:1')],[('Назад','v3:back'),('Отмена','home')]]
+    await m.answer(f'{names[month-1]} {year}\n× — выходной; • — нет свободных окон.\nМожно ввести дату ДД.ММ.ГГГГ.',reply_markup=kb(rows))
+
+async def back(m,uid,state):
+    d=await state.get_data();a=d.get('action','')
+    wizard=d.get('wizard')
+    if wizard:
+        stages={'profile':['name','bio','review'],'service':['name','minutes','price','review'],'contacts':['name','phone','review']}
+        seq=stages[wizard];idx=seq.index(d['stage'])
+        if idx:return await wizard_step(m,state,wizard,seq[idx-1])
+        return await dispatch(m,uid,'services' if wizard=='service' else 'staff' if wizard=='profile' else 'home',state)
+    if a in ('phone','confirm') and not d.get('move'):
+        await state.set_state(Form.text);await state.update_data(action='name');return await m.answer('Введите имя клиента:',reply_markup=NAV)
+    if a=='name' or (a=='confirm' and d.get('move')):return await dates(m,state)
+    if a=='date' and d.get('mid') and not d.get('move'):return await select_services(m,state,d['mid'])
+    if a=='clock' and d.get('which')=='end':return await clock(m,state,'start')
+    if a in ('clock','step','target','block_confirm','schedule_date','block_date') and await master(uid):return await schedule_menu(m,state,uid)
+    if uid==MANAGER:return await cabinet(m,uid,state,'manager')
+    if await master(uid):return await cabinet(m,uid,state,'staff')
+    return await home(m,uid,state)
+
+async def wizard_step(m,state,kind,stage):
+    await state.set_state(Form.text);await state.update_data(action='wizard',wizard=kind,stage=stage)
+    d=await state.get_data();rows=[]
+    if stage=='review':
+        await state.set_state(None)
+        if kind=='profile':text=f"Имя: {d['wname']}\nСпециализация: {d.get('wbio','')}"
+        elif kind=='service':text=f"Услуга: {d['wname']}\nДлительность: {d['wminutes']} мин\nЦена: {d['wprice'] or 'без цены'}"
+        else:text=f"Имя: {d['wname']}\nТелефон: {d['wphone']}"
+        rows.append([('Сохранить','v3:wizard_save')])
+    else:
+        text={'name':'Введите имя:' if kind!='service' else 'Введите название услуги:','bio':'Укажите специализацию / описание:','minutes':'Введите длительность в минутах (5–720):','price':'Введите цену или выберите «Без цены»:','phone':'Введите телефон (10–15 цифр):'}[stage]
+        if stage in ('bio','price'):rows.append([('Без описания' if stage=='bio' else 'Без цены','v3:skip')])
+    rows.append([('Назад','v3:back'),('Отмена','home')])
+    await m.answer(text,reply_markup=kb(rows))
+
+async def wizard_value(m,uid,state,text):
+    d=await state.get_data();kind=d['wizard'];stage=d['stage']
+    if kind in ('profile','service') and not await master(uid):raise ValueError('Права мастера отозваны.')
+    if kind=='contacts':
+        b=await sql('SELECT * FROM bookings WHERE id=?',(d['bid'],),True)
+        if not await access_booking(uid,b,True):raise ValueError('Нет прав.')
+    if stage=='name':
+        if not 1<=len(text)<= (100 if kind=='contacts' else 80):raise ValueError('Недопустимая длина имени/названия.')
+        await state.update_data(wname=text)
+        return await wizard_step(m,state,kind,{'profile':'bio','service':'minutes','contacts':'phone'}[kind])
+    if stage=='bio':
+        if len(text)>500:raise ValueError('Описание до 500 символов.')
+        await state.update_data(wbio='' if text=='-' else text)
+    elif stage=='minutes':
+        if not text.isdecimal() or not 5<=int(text)<=720:raise ValueError('Длительность 5–720 минут.')
+        await state.update_data(wminutes=int(text));return await wizard_step(m,state,kind,'price')
+    elif stage=='price':
+        price=None if text=='-' else text.replace(',','.')
+        if price is not None and not re.fullmatch(r'\d{1,7}(\.\d{1,2})?',price):raise ValueError('Введите число или нажмите «Без цены».')
+        await state.update_data(wprice=price)
+    elif stage=='phone':
+        phone=re.sub(r'[\s()\-]','',text)
+        if not re.fullmatch(r'\+?\d{10,15}',phone):raise ValueError('Номер должен содержать 10–15 цифр.')
+        await state.update_data(wphone=phone)
+    else:raise ValueError('Используйте кнопки подтверждения.')
+    await wizard_step(m,state,kind,'review')
+
+async def wizard_save(m,uid,state):
+    d=await state.get_data();kind=d.get('wizard')
+    if d.get('stage')!='review':raise ValueError('Форма устарела.')
+    if kind in ('profile','service') and not await master(uid):raise ValueError('Нет прав мастера.')
+    if kind=='profile':
+        await sql('UPDATE masters SET name=?,bio=? WHERE id=? AND enabled=1',(d['wname'],d['wbio'],uid))
+        await m.answer('Профиль сохранён.');await cabinet(m,uid,state,'staff');return await readiness(m,uid)
+    if kind=='service':
+        if d.get('sid'):await sql('UPDATE services SET name=?,minutes=?,price=? WHERE id=? AND master=?',(d['wname'],d['wminutes'],d['wprice'],d['sid'],uid))
+        else:await sql('INSERT INTO services(master,name,minutes,price) VALUES(?,?,?,?)',(uid,d['wname'],d['wminutes'],d['wprice']))
+        await state.clear();await m.answer('Услуга сохранена. Существующие записи не изменены.');return await dispatch(m,uid,'services',state)
+    if kind=='contacts':
+        b=await sql('SELECT * FROM bookings WHERE id=?',(d['bid'],),True)
+        if not await access_booking(uid,b,True):raise ValueError('Нет прав.')
+        await sql('UPDATE bookings SET name=?,phone=? WHERE id=?',(d['wname'],d['wphone'],d['bid']))
+        await state.clear();await m.answer('Контакты сохранены. Привязка Telegram не изменена.');return await card(m,uid,d['bid'])
+
+async def schedule_menu(m,state,uid):
+    await _schedule2(m,state,uid)
+async def target_menu(m,state,uid,target):
+    await _target2(m,state,uid,target)
+async def clock(m,state,which):
+    await _clock2(m,state,which)
+
+async def danger(m,uid,k,state):
+    d=await state.get_data()
+    if not await master(uid):raise ValueError('Нет прав мастера.')
+    text='Подтвердите действие. Существующие записи не отменяются.'
+    # Snapshot the underlying timetable so a stale delete cannot target another interval.
+    snapshot=None
+    if k in ('off','reset') or k.startswith('interval_del:'):
+        if d.get('action')!='target':raise ValueError('Откройте день заново.')
+        r=await sql('SELECT intervals FROM v2_schedule WHERE master=? AND target=?',(uid,d['target']),True)
+        snapshot=r['intervals'] if r else None
+        ws=unpack(snapshot) if snapshot else []
+        if k=='off':text='Сделать выбранный день выходным?'
+        elif k=='reset':text='Удалить исключение и вернуть недельный график?'
+        else:
+            idx=int(k.split(':')[1])
+            if not 0<=idx<len(ws):raise ValueError('Список изменился.')
+            text=f'Удалить рабочий интервал {ws[idx][0]}–{ws[idx][1]}?'
+        rows=await sql("SELECT * FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND start>?",(uid,ts()))
+        affected=[]
+        for b in rows:
+            day=datetime.fromtimestamp(b['start'],TZ).date();target=d['target']
+            if (target.startswith('w:') and day.weekday()==int(target[2:])) or target=='d:'+day.isoformat():affected.append(b)
+        if affected:text+='\nПроверьте записи этого дня/дня недели: '+', '.join('#'+str(b['id']) for b in affected)[:2500]
+    elif k=='block_save':
+        if d.get('action')!='block_confirm':raise ValueError('Форма устарела.')
+        day=datetime.strptime(d['day'],'%d.%m.%Y').date();a,b=bounds([d['start'],d['end']],day)
+        rows=await sql("SELECT id,start FROM bookings WHERE master=? AND status='active' AND start<? AND end>?",(uid,b,a))
+        text=f"Закрыть {d['day']} {d['start']}–{d['end']}?"
+        if rows:text+='\nПересекаются записи: '+', '.join('#'+str(x['id'])+' '+fmt(x['start']) for x in rows)[:2500]
+    elif k.startswith('hide:'):text='Скрыть услугу из каталога? Уже оформленные записи сохранятся.'
+    elif k.startswith('unblock:'):text='Открыть закрытый интервал для новых записей?'
+    nonce=secrets.token_hex(6)
+    await state.update_data(danger=dict(key=k,nonce=nonce,snapshot=snapshot))
+    await m.answer(text+'\nЗаписи клиентов автоматически НЕ отменяются.',reply_markup=kb([[('Подтвердить','v3:danger:'+nonce)],[('Назад','v3:back'),('Отмена','home')]]))
+
+async def dispatch(m,uid,k,state):
+    d=await state.get_data()
+    if k=='v3:noop':return
+    if k=='v3:back':return await back(m,uid,state)
+    if k in ('staff','manager'):return await cabinet(m,uid,state,k)
+    if k=='v3:ready':
+        if await master(uid):return await readiness(m,uid)
+        return
+    if k=='v3:masters':
+        if uid!=MANAGER:return
+        await state.clear()
+        rows=await sql('SELECT * FROM masters ORDER BY enabled DESC,name')
+        if not rows:await m.answer('Мастеров пока нет.')
+        for i in range(0,len(rows),25):await m.answer('Мастера:',reply_markup=kb([[((p['name'] or str(p['id']))+(' · отключён' if not p['enabled'] else ''),f"v3:master:{p['id']}")] for p in rows[i:i+25]]))
+        return await m.answer('Действия:',reply_markup=kb([[('Выдать права','grant'),('В кабинет','manager')]]))
+    if k.startswith('v3:master:'):
+        if uid==MANAGER:return await master_card(m,int(k.split(':')[2]))
+        return
+    if k.startswith('v3:right:'):
+        if uid!=MANAGER:return
+        _,_,mid,value=k.split(':');mid=int(mid);value=int(value)
+        if value not in (0,1):return
+        p=await sql('SELECT * FROM masters WHERE id=?',(mid,),True)
+        if not p:return
+        count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND start>?",(mid,ts()),True)
+        await state.set_data(dict(action='rights',mid=mid,value=value,old=p['enabled'],nonce=secrets.token_hex(6)))
+        d=await state.get_data()
+        return await m.answer(('Восстановить' if value else 'Отозвать')+f" права мастера {p['name'] or mid}?\nПредстоящих записей: {count['n']}. Они останутся у управляющего. Профиль, услуги и история сохранятся. Клиентские функции останутся доступны.",reply_markup=kb([[('Подтвердить','v3:rightok:'+d['nonce'])],[('Назад',f'v3:master:{mid}')]]))
+    if k.startswith('v3:rightok:'):
+        if uid!=MANAGER or d.get('action')!='rights' or k.split(':')[2]!=d.get('nonce'):raise ValueError('Подтверждение устарело.')
+        await sql('UPDATE masters SET enabled=? WHERE id=? AND enabled=?',(d['value'],d['mid'],d['old']))
+        target_context=dp.fsm.get_context(bot=bot,chat_id=d['mid'],user_id=d['mid'])
+        await target_context.clear();await state.clear()
+        await send(d['mid'],'Права мастера '+('восстановлены.' if d['value'] else 'отозваны. Клиентские функции сохранены.')+' Откройте главное меню.')
+        return await master_card(m,d['mid'])
+    if k.startswith('v3:manual:'):
+        if uid!=MANAGER:return
+        mid=int(k.split(':')[2]);await state.clear();await state.update_data(manual=True)
+        return await select_services(m,state,mid)
+    if k.startswith('v3:masterschedule:'):
+        if uid!=MANAGER:return
+        mid=int(k.split(':')[2]);lines=['Расписание мастера (просмотр), МСК:']
+        for r in await sql('SELECT * FROM v2_schedule WHERE master=? ORDER BY target',(mid,)):
+            label=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][int(r['target'][2:])] if r['target'].startswith('w:') else r['target'][2:]
+            lines.append(label+': '+('; '.join(f'{a}–{b} / {step} мин' for a,b,step in unpack(r['intervals'])) or 'выходной'))
+        for r in await sql('SELECT * FROM v2_blocks WHERE master=? AND end>? ORDER BY start',(mid,ts())):lines.append('Закрыто: '+fmt(r['start'])+' — '+fmt(r['end']))
+        text='\n'.join(lines)
+        for i in range(0,len(text),3500):await m.answer(text[i:i+3500])
+        return await m.answer('Карточка мастера:',reply_markup=kb([[('Назад',f'v3:master:{mid}')]]))
+    if k.startswith('v3:masterbook:'):
+        if uid!=MANAGER:return
+        p=k.split(':');return await history(m,uid,state,'master-'+p[2],int(p[3]))
+    if k.startswith('v3:history:'):
+        p=k.split(':');return await history(m,uid,state,p[2],int(p[3]))
+    if k=='v3:search':
+        if uid!=MANAGER and not await master(uid):return
+        return await prompt(m,state,'search','Введите имя (регистр букв учитывается для кириллицы) или часть телефона:')
+    if k.startswith(('v3:contacts:','v3:repeat:')):
+        p=k.split(':');bid=int(p[2]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+        if not await access_booking(uid,b,True):raise ValueError('Нет доступа.')
+        await state.clear()
+        if p[1]=='contacts':
+            await state.update_data(bid=bid);return await wizard_step(m,state,'contacts','name')
+        if not await master(b['master']):raise ValueError('Права этого мастера отозваны.')
+        s=await sql('SELECT * FROM services WHERE id=? AND active=1',(b['service'],),True)
+        if not s:raise ValueError('Услуга скрыта. Создайте ручную запись с другой услугой.')
+        await state.update_data(manual=True,mid=b['master'],sid=b['service'],name=b['name'],phone=b['phone'],repeat=bid)
+        await m.answer('Повторная ручная запись: '+b['name']+'. Контакты сохранены; запись не привязывается к Telegram клиента.')
+        return await dates(m,state)
+    if k.startswith('v3:calendar:'):
+        if d.get('action')!='date':raise ValueError('Откройте выбор даты заново.')
+        p=k.split(':');return await calendar_view(m,state,int(p[2]),int(p[3]))
+    if k.startswith('v3:date:'):
+        if d.get('action')!='date':raise ValueError('Откройте выбор даты заново.')
+        return await slots(m,state,datetime.strptime(k.split(':')[2],'%Y-%m-%d').date())
+    if k.startswith('time:') and d.get('repeat'):
+        _,sid,t=k.split(':')
+        if d.get('action')!='date' or d.get('sid')!=int(sid):raise ValueError('Меню устарело.')
+        await state.update_data(time=int(t));return await confirm(m,state)
+    if k=='profile' or k=='addservice' or k.startswith('edit:'):
+        if not await master(uid):return
+        await state.clear()
+        if k=='profile':return await wizard_step(m,state,'profile','name')
+        sid=int(k.split(':')[1]) if ':' in k else 0
+        if sid and not await sql('SELECT id FROM services WHERE id=? AND master=?',(sid,uid),True):return
+        await state.update_data(sid=sid);return await wizard_step(m,state,'service','name')
+    if k=='v3:skip':
+        if d.get('wizard') and d.get('stage') in ('bio','price'):return await wizard_value(m,uid,state,'-')
+        return
+    if k=='v3:wizard_save':return await wizard_save(m,uid,state)
+    if k.startswith('v3:danger:'):
+        pending=d.get('danger',{})
+        if pending.get('nonce')!=k.split(':')[2]:raise ValueError('Подтверждение устарело.')
+        if not await master(uid):raise ValueError('Нет прав мастера.')
+        key=pending['key']
+        if key in ('off','reset') or key.startswith('interval_del:'):
+            r=await sql('SELECT intervals FROM v2_schedule WHERE master=? AND target=?',(uid,d['target']),True)
+            if (r['intervals'] if r else None)!=pending['snapshot']:raise ValueError('График изменился. Откройте день заново.')
+        await state.update_data(danger=None)
+        await _dispatch2(m,uid,key,state)
+        if key.startswith('hide:'):return await _dispatch2(m,uid,'services',state)
+        if key=='block_save' or key.startswith('unblock:'):return await schedule_menu(m,state,uid)
+        return
+    if k in ('off','reset','block_save') or k.startswith(('interval_del:','hide:','unblock:')):return await danger(m,uid,k,state)
+    if k.startswith(('move:','cancel:','cancelok:','yes:','status:')):
+        b=await sql('SELECT * FROM bookings WHERE id=?',(int(k.split(':')[1]),),True)
+        staff=k.startswith('status:')
+        if not await access_booking(uid,b,staff):raise ValueError('Нет доступа к записи.')
+    await _dispatch2(m,uid,k,state)
+    if k in ('my',) or k.startswith('list:'):
+        await m.answer('Вернуться:',reply_markup=kb([[('Главное меню','home')]]))
+
+@dp.message(F.text.in_({'Главное меню','Назад','Отмена'}))
+async def navigation(m:Message,state:FSMContext):
+    if m.text=='Назад':
+        try:return await back(m,m.from_user.id,state)
+        except (ValueError,KeyError):pass
+    await home(m,m.from_user.id,state)
+
+@dp.message(Form.text)
+async def input_v3(m:Message,state:FSMContext):
+    uid=m.from_user.id;text=(m.text or '').strip();d=await state.get_data()
+    try:
+        if d.get('action')=='wizard':
+            if m.contact:text=m.contact.phone_number
+            return await wizard_value(m,uid,state,text)
+        if d.get('action')=='search':
+            if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+            if not 2<=len(text)<=100:raise ValueError('Введите от 2 до 100 символов.')
+            await state.set_state(None);await state.update_data(search=text)
+            return await history(m,uid,state,'search',0)
+        if d.get('action')=='grant':
+            if uid!=MANAGER:return
+            if not text.isdecimal() or int(text)<=0:raise ValueError('Нужен числовой Telegram ID.')
+            target=int(text)
+            await sql('INSERT OR IGNORE INTO masters(id) VALUES(?)',(target,))
+            p=await sql('SELECT * FROM masters WHERE id=?',(target,),True)
+            if not p['enabled']:return await dispatch(m,uid,f'v3:right:{target}:1',state)
+            await send(target,'Вам выданы права мастера. Откройте главное меню или /start.')
+            await state.clear();await m.answer('Права выданы.');return await master_card(m,target)
+        await _input2(m,state)
+    except (ValueError,OverflowError,KeyError) as e:
+        await m.answer('Проверьте ввод: '+str(e),reply_markup=NAV)
+
+@dp.message()
+async def fallback_v3(m:Message,state:FSMContext):
+    await m.answer('Выберите действие в меню. Ваш ID можно узнать командой /id.',reply_markup=NAV)
+    await home(m,m.from_user.id,state)
+
 if __name__=='__main__':asyncio.run(main())
+
