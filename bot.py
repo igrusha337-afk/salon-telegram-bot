@@ -86,6 +86,8 @@ async def initialize():
         """)
         await c.execute('BEGIN IMMEDIATE')
         master_columns=[x[1] for x in await (await c.execute('PRAGMA table_info(masters)')).fetchall()]
+        if 'position' not in master_columns:
+            await c.execute("ALTER TABLE masters ADD COLUMN position TEXT NOT NULL DEFAULT ''")
         if 'experience' not in master_columns:
             await c.execute("ALTER TABLE masters ADD COLUMN experience TEXT NOT NULL DEFAULT ''")
         cols=[x[1] for x in await (await c.execute('PRAGMA table_info(bookings)')).fetchall()]
@@ -148,26 +150,10 @@ async def select_services(m,state,mid):
     await state.update_data(mid=mid,wizard=None)
     rows=await sql('SELECT * FROM services WHERE master=? AND active=1',(mid,))
     if not rows:return await m.answer('У мастера пока нет услуг.')
-    profile_lines=[p['name']]
-    if p['experience']:
-        profile_lines.append('Стаж: '+p['experience'])
-    if p['bio']:
-        profile_lines.append(p['bio'])
-    profile_text='\n\n'.join(profile_lines)
-    photo_sent=False
-    if not (await state.get_data()).get('manual'):
-        photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(mid,),True)
-        if photo:
-            try:
-                if len(profile_text)<=1024:
-                    await m.answer_photo(photo['file_id'],caption=profile_text)
-                    photo_sent=True
-                else:
-                    await m.answer_photo(photo['file_id'])
-            except TelegramBadRequest:
-                logging.warning('Profile photo unavailable for master %s',mid)
-    if not photo_sent:
-        await m.answer(profile_text)
+    if (await state.get_data()).get('manual'):
+        await m.answer(p['name']+'\n'+p['bio'])
+    else:
+        await show_master_profile(m,p)
     for i in range(0,len(rows),30):
         await m.answer('Услуги:',reply_markup=kb([[(r['name']+f" · {r['minutes']} мин"+(f" · {r['price']} ₽" if r['price'] else ''),f"service:{r['id']}")] for r in rows[i:i+30]]))
 async def dates(m,state):
@@ -433,6 +419,7 @@ async def dispatch(m,uid,k,state):
     if not await master(uid):return
     if k=='profile':return await prompt(m,state,'profile','Имя | описание\nНапример: Анна | Мастер маникюра')
     if k=='services':
+        await state.clear()
         for s in await sql('SELECT * FROM services WHERE master=? AND active=1',(uid,)):
             await m.answer(f"{s['name']} · {s['minutes']} мин · {s['price'] or 'без цены'}",reply_markup=kb([[('Редактировать',f"edit:{s['id']}"),('Убрать',f"hide:{s['id']}")]]))
         return await m.answer('Услуги',reply_markup=kb([[('Добавить','addservice')],[('В кабинет','staff')]]))
@@ -829,7 +816,15 @@ async def wizard_save(m,uid,state):
     if kind=='service':
         if d.get('sid'):await sql('UPDATE services SET name=?,minutes=?,price=? WHERE id=? AND master=?',(d['wname'],d['wminutes'],d['wprice'],d['sid'],uid))
         else:await sql('INSERT INTO services(master,name,minutes,price) VALUES(?,?,?,?)',(uid,d['wname'],d['wminutes'],d['wprice']))
-        await state.clear();await m.answer('Услуга сохранена. Существующие записи не изменены.');return await dispatch(m,uid,'services',state)
+        await state.clear()
+        if d.get('sid'):
+            await m.answer('Услуга сохранена.')
+            return await dispatch(m,uid,'services',state)
+        await state.set_state(Form.text)
+        await state.set_data(dict(action='wizard',wizard='service',stage='name'))
+        return await m.answer('Услуга сохранена. Для добавления следующей отправьте её название.',reply_markup=kb([
+            [('Список услуг','services')],[('В кабинет','staff')]
+        ]))
     if kind=='contacts':
         b=await sql('SELECT * FROM bookings WHERE id=?',(d['bid'],),True)
         if not await access_booking(uid,b,True):raise ValueError('Нет прав.')
@@ -1466,6 +1461,11 @@ async def start_v4(m:Message,state:FSMContext):
 
 async def input_v4(m:Message,state:FSMContext):
     d=await state.get_data();uid=m.from_user.id
+    if d.get('action')=='profile_field':
+        text=(m.text or '').strip()
+        if not text:
+            return await m.answer('Введите значение текстом.')
+        return await save_profile_field(m,uid,state,d['field'],text)
     if d.get('action')=='profile_photo_upload':
         if not await master(uid):
             await state.clear()
@@ -1647,6 +1647,55 @@ async def pf_delete(m, uid, state, nonce):
     await m.answer('Фото удалено из портфолио. Ранее отправленные сообщения и резервные копии автоматически не удаляются.')
     await pf_show(m, uid, r['master'], edit=True)
 
+PROFILE_FIELDS = {
+    'name': ('Имя', 80),
+    'position': ('Должность', 80),
+    'experience': ('Стаж', 50),
+    'bio': ('Коротко о себе', 500),
+}
+
+
+async def show_master_profile(m, profile, markup=None):
+    lines=[profile['name'] or 'Имя пока не указано']
+    if profile['position']:
+        lines.append(profile['position'])
+    if profile['experience']:
+        lines.append('Стаж: '+profile['experience'])
+    if profile['bio']:
+        lines.append('\n'+profile['bio'])
+    text='\n'.join(lines)
+    photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(profile['id'],),True)
+    if photo:
+        try:
+            if len(text.encode('utf-16-le'))//2<=1024:
+                return await m.answer_photo(photo['file_id'],caption=text,reply_markup=markup)
+            await m.answer_photo(photo['file_id'])
+        except TelegramBadRequest:
+            logging.warning('Profile photo unavailable for master %s',profile['id'])
+    await m.answer(text,reply_markup=markup)
+
+
+async def master_profile_menu(m, uid, state):
+    profile=await master(uid)
+    if not profile:
+        raise ValueError('Нет прав мастера.')
+    await state.clear()
+    rows=[[(label,f'profilefield:edit:{field}')] for field,(label,_) in PROFILE_FIELDS.items()]
+    rows.extend([[('Моё фото','profilephoto:menu')],[('В кабинет','staff')]])
+    await show_master_profile(m,profile,kb(rows))
+
+
+async def save_profile_field(m, uid, state, field, value):
+    label,limit=PROFILE_FIELDS[field]
+    if len(value)>limit or (field=='name' and not value):
+        return await m.answer(f'{label}: допустимо от {1 if field=="name" else 0} до {limit} символов.')
+    saved=await sql(f'UPDATE masters SET {field}=? WHERE id=? AND enabled=1 RETURNING id',(value,uid),True)
+    if not saved:
+        await state.clear()
+        return await m.answer('Нет прав мастера.')
+    await master_profile_menu(m,uid,state)
+
+
 async def profile_photo_menu(m, uid):
     photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(uid,),True)
     rows=[[('Заменить фото' if photo else 'Добавить фото','profilephoto:add')]]
@@ -1662,6 +1711,24 @@ async def profile_photo_menu(m, uid):
 
 
 async def dispatch(m, uid, k, state):
+    if k=='profile':
+        return await master_profile_menu(m,uid,state)
+    if k.startswith('profilefield:'):
+        _,action,field=k.split(':')
+        if field not in PROFILE_FIELDS or not await master(uid):
+            raise ValueError('Действие недоступно.')
+        if action=='edit':
+            label,limit=PROFILE_FIELDS[field]
+            await state.set_state(Form.text)
+            await state.set_data(dict(action='profile_field',field=field))
+            rows=[[('К профилю','profile')]]
+            if field!='name':
+                rows.insert(0,[('Очистить поле',f'profilefield:clear:{field}')])
+            return await m.answer(f'{label}. Введите новое значение (до {limit} символов).',reply_markup=kb(rows))
+        data=await state.get_data()
+        if action=='clear' and field!='name' and data.get('action')=='profile_field' and data.get('field')==field:
+            return await save_profile_field(m,uid,state,field,'')
+        raise ValueError('Форма устарела.')
     if k.startswith('profilephoto:'):
         if not await master(uid):
             raise ValueError('Нет прав мастера.')
@@ -1725,6 +1792,8 @@ async def dispatch(m, uid, k, state):
     raise ValueError('Неизвестное действие портфолио.')
 
 async def back(m, uid, state):
+    if (await state.get_data()).get('action') == 'profile_field':
+        return await master_profile_menu(m,uid,state)
     if (await state.get_data()).get('action') == 'profile_photo_upload':
         return await dispatch(m, uid, 'profilephoto:menu', state)
     if (await state.get_data()).get('action') == 'portfolio_upload':
