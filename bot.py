@@ -972,13 +972,10 @@ async def fallback_v3(m:Message,state:FSMContext):
 
 # ---- Salon v4 ----
 import hashlib
-import csv
-import io
 import time as monotime
 from collections import deque
 from contextvars import ContextVar
 from aiogram import BaseMiddleware
-from aiogram.types import BufferedInputFile
 
 ACTOR=ContextVar('actor',default=0)
 _initialize3=initialize
@@ -1101,12 +1098,11 @@ async def home(m,uid,state):
     await _home3(m,uid,state)
     name=await setting('salon_name');contact=await setting('admin_contact')
     if name or contact:await m.answer('\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x))
-    await m.answer('Ваши данные:',reply_markup=kb([[('Выгрузить мои данные','v4:export_self'),('Запрос на удаление','v4:delete_request')]]))
 
 async def cabinet(m,uid,state,kind):
     await _cabinet3(m,uid,state,kind)
     if kind=='manager' and uid==MANAGER:
-        await m.answer('Администрирование:',reply_markup=kb([[('Настройки салона','v4:settings')],[('Журнал действий','v4:audit:0'),('Выгрузить журнал записей','v4:export_all')],[('Привязки клиентов','v4:claims'),('Запросы удаления','v4:deletions')]]))
+        await m.answer('Администрирование:',reply_markup=kb([[('Настройки салона','v4:settings')],[('Журнал действий','v4:audit:0')],[('Привязки клиентов','v4:claims'),('Запросы удаления','v4:deletions')]]))
     elif kind=='staff' and await master(uid):
         await m.answer('Ручные записи:',reply_markup=kb([[('Запросы привязки','v4:claims')]]))
 
@@ -1114,7 +1110,6 @@ def staff_buttons(b):
     old=_staffbuttons3(b);rows=list(old.inline_keyboard)
     if b['client'] is None and b['status']=='active' and b['start']>ts() and b['name']!='[Удалено]':
         rows.append([InlineKeyboardButton(text='Ссылка для клиента',callback_data=f"v4:invite:{b['id']}")])
-    rows.append([InlineKeyboardButton(text='Запросить удаление контактов',callback_data=f"v4:erasebooking:{b['id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def history(m,uid,state,scope,page=0):
@@ -1226,33 +1221,6 @@ async def decide_claim(m,uid,state,approve,nonce):
         await _send3(r['requester'],'Запись привязана к вашему аккаунту.\n'+details(current),client_buttons(current))
     else:await _send3(r['requester'],'Запрос привязки отклонён. Свяжитесь с салоном.')
 
-async def export_data(m,uid,all_data=False):
-    if all_data and uid!=MANAGER:raise ValueError('Нет доступа.')
-    query='SELECT * FROM bookings'+('' if all_data else ' WHERE client=?')+' ORDER BY start'
-    args=() if all_data else (uid,)
-    rows=await sql(query,args)
-    if all_data:
-        stream=io.StringIO();writer=csv.writer(stream)
-        cols=['id','master','service_name','start','end','name','phone','status','visit_state','confirmed']
-        writer.writerow(cols)
-        for b in rows:
-            values=[]
-            for col in cols:
-                val=fmt(b[col]) if col in ('start','end') else str(b[col] if b[col] is not None else '')
-                if val.startswith(('=','+','-','@','\t','\r')):val="'"+val
-                values.append(val)
-            writer.writerow(values)
-        payload=stream.getvalue().encode('utf-8-sig');name='bookings.csv'
-    else:
-        own_master=await sql('SELECT * FROM masters WHERE id=?',(uid,),True)
-        services=await sql('SELECT * FROM services WHERE master=?',(uid,))
-        # Do not export other clients' bookings to a master through the self-service endpoint.
-        requests=await sql('SELECT id,created,status FROM v4_delete_requests WHERE uid=?',(uid,))
-        payload=json.dumps(dict(telegram_id=uid,client_bookings=rows,master_profile=own_master,services=services,deletion_requests=requests),ensure_ascii=False,indent=2).encode('utf-8');name='my_data.json'
-    if len(payload)>45*1024*1024:raise ValueError('Выгрузка слишком большая. Требуется выгрузка администратором сервера по периодам.')
-    await m.answer_document(BufferedInputFile(payload,filename=name),caption='Конфиденциальные данные. Не публикуйте файл. Telegram сохраняет отправленные сообщения согласно своим правилам.')
-    await audit('export_all' if all_data else 'export_self')
-
 async def deletion_menu(m,uid):
     if uid!=MANAGER:raise ValueError('Нет доступа.')
     rows=await sql("SELECT * FROM v4_delete_requests WHERE status='pending' ORDER BY id LIMIT 50")
@@ -1310,33 +1278,17 @@ async def dispatch(m,uid,k,state):
     if k=='v4:claims':return await claims(m,uid)
     if k.startswith('v4:claim:'):return await claim_card(m,uid,state,int(k.split(':')[2]))
     if k.startswith(('v4:claimok:','v4:claimno:')):return await decide_claim(m,uid,state,k.startswith('v4:claimok:'),k.split(':')[2])
-    if k=='v4:export_self':return await export_data(m,uid)
-    if k=='v4:export_all':
-        if uid!=MANAGER:return
-        await state.set_state(None);await state.set_data(dict(action='export_confirm',nonce=secrets.token_hex(6)))
-        d=await state.get_data()
-        return await m.answer('Отправить в этот чат CSV со всеми записями и контактами клиентов? Не пересылайте файл посторонним.',reply_markup=kb([[('Подтвердить','v4:exportok:'+d['nonce'])],[('Отмена','home')]]))
-    if k.startswith('v4:exportok:'):
-        if uid!=MANAGER or d.get('action')!='export_confirm' or d.get('nonce')!=k.split(':')[2]:raise ValueError('Форма устарела.')
-        await state.clear();return await export_data(m,uid,True)
-    if k=='v4:delete_request':
-        await state.set_state(None);await state.set_data(dict(action='delete_request',nonce=secrets.token_hex(6)))
-        d=await state.get_data()
-        return await m.answer('Отправить управляющему запрос на удаление ваших данных? Это не отменяет записи и не удаляет данные автоматически.',reply_markup=kb([[('Отправить запрос','v4:deleteask:'+d['nonce'])],[('Отмена','home')]]))
-    if k.startswith('v4:deleteask:'):
-        if d.get('action')!='delete_request' or d.get('nonce')!=k.split(':')[2]:raise ValueError('Форма устарела.')
-        r=await sql("SELECT id FROM v4_delete_requests WHERE uid=? AND status IN ('pending','review_required')",(uid,),True)
-        if not r:await sql('INSERT INTO v4_delete_requests(uid,created) VALUES(?,?)',(uid,ts()))
-        await state.clear();await m.answer('Запрос зарегистрирован. Для уточнения сроков свяжитесь с администратором.')
-        await _send3(MANAGER,f'Запрос удаления данных от Telegram ID {uid}. Рассмотрите в кабинете.',kb([[('Запросы','v4:deletions')]]));return
+    if k in ('v4:export_self','v4:export_all') or k.startswith('v4:exportok:'):
+        return await m.answer('Выгрузка данных отключена.')
+    if k=='v4:delete_request' or k.startswith('v4:deleteask:'):
+        return await m.answer('Подача запросов через бота отключена.')
     if k=='v4:deletions':return await deletion_menu(m,uid)
     if k.startswith('v4:deletion:'):return await prepare_erasure(m,uid,state,request_id=int(k.split(':')[2]))
     if k.startswith('v4:erasebooking:'):
         bid=int(k.split(':')[2]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
         if not await access_booking(uid,b,True):raise ValueError('Нет доступа.')
         if uid!=MANAGER:
-            await _send3(MANAGER,f'Мастер запросил проверку удаления контактов записи №{bid}.',kb([[('Проверить',f'v4:erasebooking:{bid}')]]))
-            return await m.answer('Запрос передан управляющему. Данные пока не изменены.')
+            return await m.answer('Подача запросов через бота отключена.')
         return await prepare_erasure(m,uid,state,bid=bid)
     if k.startswith('v4:eraseok:'):return await erase_confirm(m,uid,state,k.split(':')[2])
     if k.startswith('v4:audit:'):
