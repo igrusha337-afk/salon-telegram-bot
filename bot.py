@@ -212,6 +212,15 @@ async def save(uid,d):
         if not old and not active_master:raise ValueError('Мастер недоступен для новых записей.')
         if old and uid not in MANAGERS and uid!=old['client'] and not active_master:raise ValueError('Права мастера отозваны.')
         if d.get('manual') and uid not in MANAGERS and (uid!=s['master'] or not active_master):raise ValueError('Нет прав.')
+        client = None if d.get('manual') else uid
+        if not old and d.get('manual') and d.get('repeat'):
+            original = await (await c.execute(
+                'SELECT client FROM bookings WHERE id=? AND master=? AND service=?',
+                (d['repeat'], s['master'], s['id']),
+            )).fetchone()
+            if not original:
+                raise ValueError('Исходная запись недоступна. Откройте её заново.')
+            client = original['client']
         if not old and not d.get('manual'):
             count=await (await c.execute("SELECT COUNT(*) FROM bookings WHERE client=? AND status='active' AND end>?",(uid,ts()))).fetchone()
             if count[0]>=MAX_ACTIVE:raise ValueError(f'Достигнут лимит активных записей: {MAX_ACTIVE}. Отмените ненужную запись или свяжитесь с салоном.')
@@ -225,7 +234,7 @@ async def save(uid,d):
         if old:
             await c.execute('UPDATE bookings SET start=?,end=?,reminder=?,confirmed=0 WHERE id=?',(t,end,rem,old['id'])); bid=old['id']
         else:
-            cur=await c.execute('INSERT INTO bookings(master,service,service_name,price,start,end,client,name,phone,reminder) VALUES(?,?,?,?,?,?,?,?,?,?)',(s['master'],s['id'],s['name'],s['price'],t,end,None if d.get('manual') else uid,d['name'],d['phone'],rem));bid=cur.lastrowid
+            cur=await c.execute('INSERT INTO bookings(master,service,service_name,price,start,end,client,name,phone,reminder) VALUES(?,?,?,?,?,?,?,?,?,?)',(s['master'],s['id'],s['name'],s['price'],t,end,client,d['name'],d['phone'],rem));bid=cur.lastrowid
         await c.commit();return bid
 
 async def listing(m,uid,scope,period):
@@ -961,7 +970,7 @@ async def dispatch(m,uid,k,state):
         s=await sql('SELECT * FROM services WHERE id=? AND active=1',(b['service'],),True)
         if not s:raise ValueError('Услуга скрыта. Создайте ручную запись с другой услугой.')
         await state.update_data(manual=True,mid=b['master'],sid=b['service'],name=b['name'],phone=b['phone'],repeat=bid)
-        await m.answer('Повторная ручная запись: '+b['name']+'. Контакты сохранены; запись не привязывается к Telegram клиента.')
+        await m.answer('Повторная ручная запись: '+b['name']+'. Если исходная запись привязана к Telegram, клиент увидит новый визит в «Мои записи» и получит уведомление.')
         return await dates(m,state)
     if k.startswith('v3:calendar:'):
         if d.get('action')!='date':raise ValueError('Откройте выбор даты заново.')
