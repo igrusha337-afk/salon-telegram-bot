@@ -120,7 +120,31 @@ async def intervals(c,mid,day):
 def bounds(w,day):
     return tuple(int(datetime.combine(day,time.fromisoformat(t),TZ).timestamp()) for t in w[:2])
 def allowed(ws,day,start,end):
-    return any(bounds(w,day)[0]<=start and end<=bounds(w,day)[1] and (start-bounds(w,day)[0])%(w[2]*60)==0 for w in ws)
+    if end<=start:
+        return False
+    for w in ws:
+        a,b=bounds(w,day)
+        step=w[2]*60
+        if step>0 and a<=start<b and end<=b and (start-a)%step==0:
+            return True
+    return False
+
+
+def free_starts(ws,day,minutes,busy,after):
+    if minutes<=0:
+        return []
+    starts=set()
+    for w in ws:
+        a,b=bounds(w,day)
+        step=w[2]*60
+        if step<=0:
+            continue
+        for start in range(a,b,step):
+            end=start+minutes*60
+            if start>after and end<=b and not any(start<x['end'] and end>x['start'] for x in busy):
+                starts.add(start)
+    return sorted(starts)
+
 
 async def prompt(m,state,action,text,**data):
     await state.set_state(Form.text); await state.set_data(dict(action=action,**data))
@@ -174,15 +198,9 @@ async def slots(m,state,day):
     left=int(datetime.combine(day,time.min,TZ).timestamp()); right=left+86400
     busy=await sql("SELECT start,end FROM bookings WHERE master=? AND status='active' AND start<? AND end>? AND id<>?",(s['master'],right,left,d.get('move',0)))
     busy+=await sql('SELECT start,end FROM v2_blocks WHERE master=? AND start<? AND end>?',(s['master'],right,left))
-    available=set()
-    for w in ws:
-        a,b=bounds(w,day)
-        for t in range(a,b,w[2]*60):
-            end=t+s['minutes']*60
-            if t>ts() and end<=b and not any(t<x['end'] and end>x['start'] for x in busy):available.add(t)
+    values=free_starts(ws,day,s['minutes'],busy,ts())
     await state.update_data(action='date',sid=s['id'])
-    if not available:return await m.answer('Свободных окон нет. Введите другую дату.')
-    values=sorted(available)
+    if not values:return await m.answer('Свободных окон нет. Введите другую дату.')
     for i in range(0,len(values),40):await m.answer('Время '+day.strftime('%d.%m.%Y'),reply_markup=kb([[(datetime.fromtimestamp(t,TZ).strftime('%H:%M'),f"time:{s['id']}:{t}")] for t in values[i:i+40]]))
 
 def details(b):
@@ -304,7 +322,7 @@ async def clock_value(m,state,value):
         await state.update_data(action='block_confirm')
         return await m.answer(f"Закрыть {d['day']} {d['start']}–{value}? Существующие записи не отменяются.",reply_markup=kb([[('Закрыть','block_save')],[('Отмена','schedule')]]))
     await state.update_data(action='step')
-    await m.answer('Шаг начала записей:',reply_markup=kb([[(f'{n} мин',f'step:{n}') for n in (5,10,15)],[(f'{n} мин',f'step:{n}') for n in (20,30,60)]]))
+    await m.answer('Шаг начала записей. Ко времени окончания интервала визит должен завершиться:',reply_markup=kb([[(f'{n} мин',f'step:{n}') for n in (5,10,15)],[(f'{n} мин',f'step:{n}') for n in (20,30,60)]]))
 async def conflicts(m,uid):
     rows=await sql("SELECT * FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND end>?",(uid,ts()));bad=[]
     async with aiosqlite.connect(DB) as c:
@@ -360,8 +378,16 @@ async def dispatch(m,uid,k,state):
     if k.startswith('time:'):
         _,sid,t=k.split(':')
         if d.get('sid')!=int(sid) or d.get('action')!='date':raise ValueError('Устаревшее меню.')
-        await state.update_data(time=int(t))
-        if d.get('move'):return await confirm(m,state)
+        start=int(t)
+        service=await service_for(d)
+        day=datetime.fromtimestamp(start,TZ).date()
+        async with aiosqlite.connect(DB) as c:
+            ws=await intervals(c,service['master'],day) if service else []
+        if not service or start<=ts() or not allowed(ws,day,start,start+service['minutes']*60):
+            await m.answer('Это время недоступно по графику. Выберите другое.')
+            return await slots(m,state,day)
+        await state.update_data(time=start)
+        if d.get('move') or d.get('repeat'):return await confirm(m,state)
         await state.set_state(Form.text);await state.update_data(action='name');return await m.answer('Введите имя клиента:')
     if k=='confirm':
         if d.get('action')!='confirm':raise ValueError('Запись уже обработана или меню устарело.')
@@ -701,12 +727,7 @@ async def availability(s,day,move=0):
     left=int(datetime.combine(day,time.min,TZ).timestamp());right=left+86400
     busy=await sql("SELECT start,end FROM bookings WHERE master=? AND status='active' AND start<? AND end>? AND id<>?",(s['master'],right,left,move))
     busy+=await sql('SELECT start,end FROM v2_blocks WHERE master=? AND start<? AND end>?',(s['master'],right,left))
-    for w in ws:
-        a,b=bounds(w,day)
-        for t in range(a,b,w[2]*60):
-            end=t+s['minutes']*60
-            if t>ts() and end<=b and not any(t<x['end'] and end>x['start'] for x in busy):return 'free'
-    return 'full'
+    return 'free' if free_starts(ws,day,s['minutes'],busy,ts()) else 'full'
 
 async def dates(m,state):
     await state.set_state(Form.text);await state.update_data(action='date')
@@ -1016,10 +1037,6 @@ async def dispatch(m,uid,k,state):
     if k.startswith('v3:date:'):
         if d.get('action')!='date':raise ValueError('Откройте выбор даты заново.')
         return await slots(m,state,datetime.strptime(k.split(':')[2],'%Y-%m-%d').date())
-    if k.startswith('time:') and d.get('repeat'):
-        _,sid,t=k.split(':')
-        if d.get('action')!='date' or d.get('sid')!=int(sid):raise ValueError('Меню устарело.')
-        await state.update_data(time=int(t));return await confirm(m,state)
     if k=='profile' or k=='addservice' or k.startswith('edit:'):
         if not await master(uid):return
         await state.clear()
