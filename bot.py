@@ -362,7 +362,20 @@ async def dispatch(m,uid,k,state):
             await m.answer(str(e));return await dates(m,state)
         b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True);await state.clear()
         title='Запись перенесена' if d.get('move') else 'Запись оформлена'
-        await m.answer(title+'\n'+details(b),reply_markup=client_buttons(b) if b['client']==uid else staff_buttons(b))
+        markup=client_buttons(b) if b['client']==uid else staff_buttons(b)
+        text=title+'\n'+details(b)
+        if d.get('repeat'):
+            text+='\n'+('Визит добавлен в «Мои записи» клиента.' if b['client'] is not None else
+                       'Исходный визит без привязки. Используйте «Ссылка для клиента», чтобы привязать новый визит.')
+            if uid==b['master'] and await master(uid):
+                markup=InlineKeyboardMarkup(inline_keyboard=markup.inline_keyboard+[
+                    [InlineKeyboardButton(text='Кабинет мастера',callback_data='staff')]
+                ])
+            elif uid in MANAGERS:
+                markup=InlineKeyboardMarkup(inline_keyboard=markup.inline_keyboard+[
+                    [InlineKeyboardButton(text='Управление салоном',callback_data='manager')]
+                ])
+        await m.answer(text,reply_markup=markup)
         for recipient in {b['master'],b['client']}-{None,uid}:
             await send_booking_recipient(recipient,b,title+'\n'+details(b),staff_buttons(b))
         return
@@ -970,7 +983,8 @@ async def dispatch(m,uid,k,state):
         s=await sql('SELECT * FROM services WHERE id=? AND active=1',(b['service'],),True)
         if not s:raise ValueError('Услуга скрыта. Создайте ручную запись с другой услугой.')
         await state.update_data(manual=True,mid=b['master'],sid=b['service'],name=b['name'],phone=b['phone'],repeat=bid)
-        await m.answer('Повторная ручная запись: '+b['name']+'. Если исходная запись привязана к Telegram, клиент увидит новый визит в «Мои записи» и получит уведомление.')
+        binding='Исходный визит привязан к Telegram клиента.' if b['client'] is not None else 'Исходный визит пока без привязки к Telegram.'
+        await m.answer('Повторная ручная запись: '+b['name']+'. '+binding)
         return await dates(m,state)
     if k.startswith('v3:calendar:'):
         if d.get('action')!='date':raise ValueError('Откройте выбор даты заново.')
