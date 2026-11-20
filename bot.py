@@ -25,7 +25,8 @@ if not TOKEN or TOKEN=='replace_me': raise SystemExit('Настройка BOT_TO
 raw=os.getenv('MANAGER_ID','').strip()
 if not raw.isdecimal() or int(raw)<=0: raise SystemExit('MANAGER_ID должен быть числовым Telegram ID, не username. Временно укажите 1, затем узнайте свой ID командой /id.')
 MANAGER=int(raw)
-DB=Path(os.getenv('DB_PATH','salon.sqlite3')).expanduser().resolve()
+DATA_DIR=Path(os.getenv('DATA_DIR') or '.')
+DB=Path(os.getenv('DB_PATH') or DATA_DIR/'salon.sqlite3').expanduser().resolve()
 BACKUPS=Path(os.getenv('BACKUP_DIR',str(DB.parent/'backups'))).expanduser().resolve()
 TZ=ZoneInfo('Europe/Moscow')
 bot=Bot(TOKEN)
@@ -121,7 +122,6 @@ async def home(m,uid,state):
     if uid==MANAGER: rows.append([('Управление салоном','manager')])
     await m.answer('Журнал салона · версия 2 · МСК',reply_markup=kb(rows))
 
-@dp.message(Command('start','cancel'))
 async def start(m:Message,state:FSMContext): await home(m,m.from_user.id,state)
 @dp.message(Command('id'))
 async def identifier(m:Message): await m.answer(f'Ваш Telegram ID: {m.from_user.id}')
@@ -137,7 +137,7 @@ async def select_masters(m,state,manual=False):
 async def select_services(m,state,mid):
     p=await master(mid)
     if not p or not p['name']:return await m.answer('Сначала заполните профиль мастера.')
-    await state.update_data(mid=mid)
+    await state.update_data(mid=mid,wizard=None)
     rows=await sql('SELECT * FROM services WHERE master=? AND active=1',(mid,))
     if not rows:return await m.answer('У мастера пока нет услуг.')
     await m.answer(p['name']+'\n'+p['bio'])
@@ -207,6 +207,9 @@ async def save(uid,d):
         if not old and not active_master:raise ValueError('Мастер недоступен для новых записей.')
         if old and uid!=MANAGER and uid!=old['client'] and not active_master:raise ValueError('Права мастера отозваны.')
         if d.get('manual') and uid!=MANAGER and (uid!=s['master'] or not active_master):raise ValueError('Нет прав.')
+        if not old and not d.get('manual'):
+            count=await (await c.execute("SELECT COUNT(*) FROM bookings WHERE client=? AND status='active' AND end>?",(uid,ts()))).fetchone()
+            if count[0]>=MAX_ACTIVE:raise ValueError(f'Достигнут лимит активных записей: {MAX_ACTIVE}. Отмените ненужную запись или свяжитесь с салоном.')
         t=d['time']; end=t+s['minutes']*60; day=datetime.fromtimestamp(t,TZ).date()
         if t<=ts() or day>now().date()+timedelta(days=365):raise ValueError('Выберите будущую дату в пределах года.')
         if not allowed(await intervals(c,s['master'],day),day,t,end):raise ValueError('График изменился. Выберите время заново.')
@@ -218,6 +221,7 @@ async def save(uid,d):
             await c.execute('UPDATE bookings SET start=?,end=?,reminder=?,confirmed=0 WHERE id=?',(t,end,rem,old['id'])); bid=old['id']
         else:
             cur=await c.execute('INSERT INTO bookings(master,service,service_name,price,start,end,client,name,phone,reminder) VALUES(?,?,?,?,?,?,?,?,?,?)',(s['master'],s['id'],s['name'],s['price'],t,end,None if d.get('manual') else uid,d['name'],d['phone'],rem));bid=cur.lastrowid
+        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'booking_moved' if old else 'booking_created',bid))
         await c.commit();return bid
 
 async def listing(m,uid,scope,period):
@@ -346,7 +350,7 @@ async def dispatch(m,uid,k,state):
         title='Запись перенесена' if d.get('move') else 'Запись оформлена'
         await m.answer(title+'\n'+details(b),reply_markup=client_buttons(b) if b['client']==uid else staff_buttons(b))
         for recipient in {b['master'],b['client']}-{None,uid}:
-            await send(recipient,title+'\n'+details(b),client_buttons(b) if recipient==b['client'] else staff_buttons(b))
+            await send_booking_recipient(recipient,b,title+'\n'+details(b),staff_buttons(b))
         return
     if k.startswith(('move:','cancel:','cancelok:','yes:','status:')):
         p=k.split(':');action=p[0];bid=int(p[1]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
@@ -364,7 +368,7 @@ async def dispatch(m,uid,k,state):
             if int(p[2])!=b['start']:raise ValueError('Время изменилось. Откройте «Мои записи».')
             updated=await sql("UPDATE bookings SET confirmed=1 WHERE id=? AND start=? AND status='active' AND visit_state='expected' AND confirmed=0 AND start>? RETURNING id",(bid,b['start'],ts()))
             await m.answer('Спасибо! Визит подтверждён.')
-            if updated:await send(b['master'],f"Клиент подтвердил визит №{bid}: {fmt(b['start'])}")
+            if updated:await send_staff(b['master'],f"Клиент подтвердил визит №{bid}: {fmt(b['start'])}")
             return
         if action=='cancel':return await m.answer('Отменить запись?\n'+details(b),reply_markup=kb([[('Да, отменить',f"cancelok:{bid}:{b['start']}")],[('Назад','home')]]))
         if action=='cancelok':
@@ -372,7 +376,7 @@ async def dispatch(m,uid,k,state):
             changed=await sql("UPDATE bookings SET status='cancelled' WHERE id=? AND start=? AND status='active' AND visit_state='expected' AND start>? RETURNING id",(bid,b['start'],ts()))
             if not changed:raise ValueError('Запись уже изменена.')
             await m.answer('Запись отменена, время освобождено.')
-            for recipient in {b['master'],b['client']}-{None,uid}:await send(recipient,'Запись отменена\n'+details(dict(b,status='cancelled')))
+            for recipient in {b['master'],b['client']}-{None,uid}:await send_booking_recipient(recipient,dict(b,status='cancelled'),'Запись отменена\n'+details(dict(b,status='cancelled')))
             return
         await state.clear();await state.update_data(move=bid,original=b['start'],sid=b['service'],mid=b['master'],name=b['name'],phone=b['phone'],manual=False)
         return await dates(m,state)
@@ -586,7 +590,7 @@ def details(b):
 def staff_buttons(b):
     old=_staffbuttons2(b)
     rows=[] if old is None else list(old.inline_keyboard)
-    rows.append([InlineKeyboardButton(text='Имя и телефон',callback_data=f"v3:contacts:{b['id']}")])
+    rows.append([InlineKeyboardButton(text='Изменить данные клиента',callback_data=f"v3:contacts:{b['id']}")])
     rows.append([InlineKeyboardButton(text='Записать повторно',callback_data=f"v3:repeat:{b['id']}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -610,7 +614,7 @@ async def cabinet(m,uid,state,kind):
         rows=[[('Мастера','v3:masters'),('Выдать права','grant')],[('Записать клиента','manual_all')]]
     else:
         rows=[[('Профиль','profile'),('Услуги','services')],[('Расписание','schedule'),('Записать клиента','manual_self')],[('Проверка готовности','v3:ready')]]
-    rows += [[('Сегодня',f'list:{kind}:today'),('Завтра',f'list:{kind}:tomorrow')],[('7 дней',f'list:{kind}:week'),('30 дней',f'list:{kind}:month')],[('Все предстоящие',f'list:{kind}:all')],[('История',f'v3:history:{kind}:0'),('Поиск клиента','v3:search')],[('Главное меню','home')]]
+    rows += [[('Сегодня',f'list:{kind}:today'),('Завтра',f'list:{kind}:tomorrow')],[('7 дней',f'list:{kind}:week'),('30 дней',f'list:{kind}:month')],[('Предстоящие записи',f'list:{kind}:all')],[('История',f'v3:history:{kind}:0'),('Поиск клиента','v3:search')],[('Главное меню','home')]]
     await m.answer('CRM Салона',reply_markup=kb(rows))
 
 async def readiness(m,mid):
@@ -909,7 +913,7 @@ async def dispatch(m,uid,k,state):
         return
     if k=='v3:wizard_save':return await wizard_save(m,uid,state)
     if k.startswith('v3:danger:'):
-        pending=d.get('danger',{})
+        pending=d.get('danger') or {}
         if pending.get('nonce')!=k.split(':')[2]:raise ValueError('Подтверждение устарело.')
         if not await master(uid):raise ValueError('Нет прав мастера.')
         key=pending['key']
@@ -937,7 +941,6 @@ async def navigation(m:Message,state:FSMContext):
         except (ValueError,KeyError):pass
     await home(m,m.from_user.id,state)
 
-@dp.message(Form.text)
 async def input_v3(m:Message,state:FSMContext):
     uid=m.from_user.id;text=(m.text or '').strip();d=await state.get_data()
     try:
@@ -962,10 +965,674 @@ async def input_v3(m:Message,state:FSMContext):
     except (ValueError,OverflowError,KeyError) as e:
         await m.answer('Проверьте ввод: '+str(e),reply_markup=NAV)
 
-@dp.message()
 async def fallback_v3(m:Message,state:FSMContext):
     await m.answer('Выберите действие в меню. Ваш ID можно узнать командой /id.',reply_markup=NAV)
     await home(m,m.from_user.id,state)
 
+
+# ---- Salon v4 ----
+import hashlib
+import csv
+import io
+import time as monotime
+from collections import deque
+from contextvars import ContextVar
+from aiogram import BaseMiddleware
+from aiogram.types import BufferedInputFile
+
+ACTOR=ContextVar('actor',default=0)
+_initialize3=initialize
+_dispatch3=dispatch
+_home3=home
+_cabinet3=cabinet
+_staffbuttons3=staff_buttons
+_input3=input_v3
+_start3=start
+_send3=send
+
+
+def positive_env(name,default,minimum=1,maximum=10000):
+    value=os.getenv(name,str(default))
+    if not value.isdecimal() or not minimum<=int(value)<=maximum:
+        raise SystemExit(f'{name}: требуется число {minimum}–{maximum}.')
+    return int(value)
+MAX_ACTIVE=positive_env('MAX_ACTIVE_BOOKINGS',5)
+RATE_COUNT=positive_env('RATE_LIMIT_COUNT',20)
+RATE_SECONDS=positive_env('RATE_LIMIT_SECONDS',10)
+LINK_HOURS=positive_env('LINK_TTL_HOURS',24,1,168)
+
+
+def phone_norm(text):
+    value=re.sub(r'[^0-9]','',text or '')
+    if len(value)==11 and value[0]=='8':value='7'+value[1:]
+    return value
+
+def folded(text):return (text or '').casefold().replace('ё','е')
+
+async def sql(q,args=(),one=False):
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        c.row_factory=aiosqlite.Row
+        await c.create_function('casefold',1,folded)
+        await c.create_function('digits',1,phone_norm)
+        cur=await c.execute(q,args);rows=await cur.fetchall()
+        verb=q.lstrip().split(None,1)[0].upper()
+        # Metadata only: never store SQL arguments, tokens, names or telephone numbers.
+        if verb in ('UPDATE','INSERT','DELETE') and re.search(r'\b(bookings|masters|services|v2_schedule|v2_blocks)\b',q,re.I):
+            table=re.search(r'\b(bookings|masters|services|v2_schedule|v2_blocks)\b',q,re.I).group(1)
+            if cur.rowcount!=0:
+                await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),ACTOR.get(),verb+' '+table,0))
+        await c.commit()
+        return (dict(rows[0]) if rows else None) if one else [dict(r) for r in rows]
+
+async def audit(event,object_id=0,actor=None):
+    await sql('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),ACTOR.get() if actor is None else actor,event,object_id))
+
+async def initialize():
+    await _initialize3()
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        await c.executescript("""
+        CREATE TABLE IF NOT EXISTS v4_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,actor INTEGER NOT NULL,event TEXT NOT NULL,object_id INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS v4_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS v4_invites(hash TEXT PRIMARY KEY,booking INTEGER NOT NULL,expires INTEGER NOT NULL,issuer INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS v4_claims(id INTEGER PRIMARY KEY AUTOINCREMENT,hash TEXT NOT NULL,requester INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',UNIQUE(hash,requester));
+        CREATE TABLE IF NOT EXISTS v4_delete_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER NOT NULL,created INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS v4_delivery(booking INTEGER NOT NULL,start INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,alerted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(booking,start));
+        CREATE INDEX IF NOT EXISTS v4_audit_time ON v4_audit(at);
+        """)
+        await c.commit()
+    if not await setting('salon_name') or not await setting('admin_contact'):
+        logging.warning('Salon name/contact not configured. Use manager settings.')
+
+async def setting(key):
+    r=await sql('SELECT value FROM v4_settings WHERE key=?',(key,),True)
+    env={'salon_name':'SALON_NAME','admin_contact':'ADMIN_CONTACT'}
+    return r['value'] if r else os.getenv(env.get(key,''),'').strip()
+
+class Guard(BaseMiddleware):
+    def __init__(self):self.hits={};self.cleanup=0
+    async def __call__(self,handler,event,data):
+        user=getattr(event,'from_user',None)
+        if not user:return await handler(event,data)
+        # This CRM exposes client data; use private dialogs only.
+        message=event.message if isinstance(event,CallbackQuery) else event
+        if getattr(getattr(message,'chat',None),'type',None)!='private':
+            if isinstance(event,CallbackQuery):await event.answer('Откройте личный чат с ботом.')
+            return
+        current=monotime.monotonic()
+        if current-self.cleanup>60:
+            self.hits={u:v for u,v in self.hits.items() if v and current-v[-1]<RATE_SECONDS}
+            self.cleanup=current
+        queue=self.hits.setdefault(user.id,deque())
+        while queue and current-queue[0]>=RATE_SECONDS:queue.popleft()
+        if len(queue)>=RATE_COUNT:
+            if isinstance(event,CallbackQuery):await event.answer('Слишком часто. Подождите несколько секунд.')
+            return
+        queue.append(current)
+        token=ACTOR.set(user.id)
+        try:return await handler(event,data)
+        except Exception as e:
+            logging.error('Handler failed: %s',type(e).__name__)
+            if message:
+                with contextlib.suppress(Exception):await message.answer('Не удалось завершить действие. Проверьте запись в меню перед повтором.',reply_markup=NAV)
+            # No exception text: Telegram errors can contain personal data or URLs.
+            with contextlib.suppress(Exception):await _send3(MANAGER,'Ошибка обработки действия: '+type(e).__name__+'. Проверьте логи приложения.')
+        finally:ACTOR.reset(token)
+
+guard=Guard()
+dp.message.outer_middleware(guard)
+dp.callback_query.outer_middleware(guard)
+
+async def send_staff(mid,text,markup=None):
+    # Recheck immediately before each attempt, not just when generating a notification.
+    for attempt in range(3):
+        if mid!=MANAGER and not await master(mid):return 'skip'
+        try:
+            await bot.send_message(mid,text,reply_markup=markup);return 'ok'
+        except TelegramRetryAfter as e:await asyncio.sleep(min(e.retry_after,60))
+        except TelegramNetworkError:await asyncio.sleep(2**attempt)
+        except (TelegramForbiddenError,TelegramBadRequest):return 'permanent'
+    return 'retry'
+
+async def send_booking_recipient(uid,b,text,markup=None):
+    if uid==b['client']:return await _send3(uid,text,client_buttons(b))
+    return await send_staff(uid,text,markup)
+
+async def home(m,uid,state):
+    await _home3(m,uid,state)
+    name=await setting('salon_name');contact=await setting('admin_contact')
+    if name or contact:await m.answer('\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x))
+    await m.answer('Ваши данные:',reply_markup=kb([[('Выгрузить мои данные','v4:export_self'),('Запрос на удаление','v4:delete_request')]]))
+
+async def cabinet(m,uid,state,kind):
+    await _cabinet3(m,uid,state,kind)
+    if kind=='manager' and uid==MANAGER:
+        await m.answer('Администрирование:',reply_markup=kb([[('Настройки салона','v4:settings')],[('Журнал действий','v4:audit:0'),('Выгрузить журнал записей','v4:export_all')],[('Привязки клиентов','v4:claims'),('Запросы удаления','v4:deletions')]]))
+    elif kind=='staff' and await master(uid):
+        await m.answer('Ручные записи:',reply_markup=kb([[('Запросы привязки','v4:claims')]]))
+
+def staff_buttons(b):
+    old=_staffbuttons3(b);rows=list(old.inline_keyboard)
+    if b['client'] is None and b['status']=='active' and b['start']>ts() and b['name']!='[Удалено]':
+        rows.append([InlineKeyboardButton(text='Ссылка для клиента',callback_data=f"v4:invite:{b['id']}")])
+    rows.append([InlineKeyboardButton(text='Запросить удаление контактов',callback_data=f"v4:erasebooking:{b['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def history(m,uid,state,scope,page=0):
+    if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+    filters=[];args=[]
+    if uid!=MANAGER:filters.append('b.master=?');args.append(uid)
+    if scope.startswith('master-'):
+        if uid!=MANAGER:raise ValueError('Нет доступа.')
+        filters.append('b.master=?');args.append(int(scope[7:]))
+    elif scope=='search':
+        term=(await state.get_data()).get('search','')
+        if not term:raise ValueError('Повторите поиск.')
+        number=phone_norm(term)
+        filters.append('(instr(casefold(b.name),?)>0 OR (?<>\'\' AND instr(digits(b.phone),?)>0))')
+        args.extend([folded(term),number,number])
+    else:
+        # History excludes active future/current visits but includes cancelled future ones.
+        filters.append("(b.status='cancelled' OR b.end<=?)");args.append(ts())
+    base=' FROM bookings b JOIN masters m ON m.id=b.master'+(' WHERE '+' AND '.join(filters) if filters else '')
+    count=await sql('SELECT COUNT(*) AS n'+base,args,True)
+    page=max(0,min(page,max(0,(count['n']-1)//8)))
+    rows=await sql('SELECT b.*,m.name AS master_name'+base+' ORDER BY b.start DESC LIMIT 8 OFFSET ?',args+[page*8])
+    await m.answer(f"Найдено: {count['n']}. Страница {page+1}.")
+    for b in rows:
+        await m.answer('Мастер: '+b['master_name']+'\n'+details(b),reply_markup=staff_buttons(b));await asyncio.sleep(.08)
+    buttons=[]
+    if page:buttons.append(('←',f'v3:history:{scope}:{page-1}'))
+    if (page+1)*8<count['n']:buttons.append(('→',f'v3:history:{scope}:{page+1}'))
+    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid==MANAGER else 'staff')]]))
+
+async def invite(m,uid,bid):
+    b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+    if not await access_booking(uid,b,True):raise ValueError('Нет доступа.')
+    if b['client'] is not None or b['status']!='active' or b['start']<=ts() or b['name']=='[Удалено]':raise ValueError('Привязка недоступна.')
+    token=secrets.token_urlsafe(24);digest=hashlib.sha256(token.encode()).hexdigest()
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        await c.execute('BEGIN IMMEDIATE')
+        await c.execute('UPDATE v4_invites SET used=1 WHERE booking=?',(bid,))
+        await c.execute('INSERT INTO v4_invites(hash,booking,expires,issuer) VALUES(?,?,?,?)',(digest,bid,ts()+LINK_HOURS*3600,uid))
+        await c.commit()
+    me=await bot.get_me()
+    await audit('invite_created',bid)
+    await m.answer(f'Отправьте эту ссылку лично клиенту. Она действует {LINK_HOURS} ч. Предыдущая ссылка аннулирована.\nПосле перехода потребуется подтверждение сотрудником салона. Не размещайте ссылку публично.\nhttps://t.me/{me.username}?start=bind_{token}')
+
+async def link_start(m,state,token):
+    await state.clear()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{32}',token):return await m.answer('Некорректная ссылка.')
+    digest=hashlib.sha256(token.encode()).hexdigest()
+    r=await sql("SELECT i.* FROM v4_invites i JOIN bookings b ON b.id=i.booking WHERE i.hash=? AND i.used=0 AND i.expires>? AND b.client IS NULL AND b.status='active' AND b.start>?",(digest,ts(),ts()),True)
+    if not r:return await m.answer('Ссылка истекла или уже использована. Обратитесь в салон.')
+    await state.update_data(action='link',hash=digest,nonce=secrets.token_hex(6))
+    d=await state.get_data()
+    await m.answer('Запросить привязку ручной записи к этому Telegram-аккаунту? Данные записи станут доступны только после проверки сотрудником салона.',reply_markup=kb([[('Подтверждаю запрос','v4:linkconfirm:'+d['nonce'])],[('Отмена','home')]]))
+
+async def create_claim(m,uid,state,k):
+    d=await state.get_data()
+    if d.get('action')!='link' or d.get('nonce')!=k.split(':')[2]:raise ValueError('Форма устарела.')
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        c.row_factory=aiosqlite.Row;await c.execute('BEGIN IMMEDIATE')
+        i=await (await c.execute("SELECT i.*,b.master FROM v4_invites i JOIN bookings b ON b.id=i.booking WHERE hash=? AND used=0 AND expires>? AND b.client IS NULL AND b.status='active' AND b.start>?",(d['hash'],ts(),ts()))).fetchone()
+        if not i:raise ValueError('Ссылка недоступна.')
+        await c.execute('INSERT OR IGNORE INTO v4_claims(hash,requester) VALUES(?,?)',(d['hash'],uid))
+        r=await (await c.execute('SELECT id FROM v4_claims WHERE hash=? AND requester=?',(d['hash'],uid))).fetchone()
+        await c.commit()
+    await state.clear();await m.answer('Запрос отправлен. Сотрудник должен проверить, что запись принадлежит вам. При необходимости свяжитесь с администратором.')
+    await audit('link_requested',i['booking'])
+    markup=kb([[('Проверить запрос',f"v4:claim:{r['id']}")]])
+    for target in {MANAGER,i['master']}:
+        await send_staff(target,f"Запрос привязки к записи №{i['booking']}. Telegram ID заявителя: {uid}. Проверьте личность через известный контакт клиента, а не только по имени профиля.",markup)
+
+async def claims(m,uid):
+    if uid!=MANAGER and not await master(uid):raise ValueError('Нет прав.')
+    q="SELECT c.id,i.booking FROM v4_claims c JOIN v4_invites i ON i.hash=c.hash JOIN bookings b ON b.id=i.booking WHERE c.status='pending' AND i.used=0 AND i.expires>?"
+    args=[ts()]
+    if uid!=MANAGER:q+=' AND b.master=?';args.append(uid)
+    rows=await sql(q+' ORDER BY c.id DESC LIMIT 50',args)
+    if not rows:return await m.answer('Нет ожидающих запросов.')
+    for r in rows:await m.answer(f"Запрос №{r['id']} · запись №{r['booking']}",reply_markup=kb([[('Проверить',f"v4:claim:{r['id']}")]]))
+
+async def claim_card(m,uid,state,cid):
+    r=await sql('SELECT c.*,i.booking,i.expires,i.used FROM v4_claims c JOIN v4_invites i ON i.hash=c.hash WHERE c.id=?',(cid,),True)
+    b=await sql('SELECT * FROM bookings WHERE id=?',(r['booking'],),True) if r else None
+    if not await access_booking(uid,b,True):raise ValueError('Нет прав.')
+    if r['status']!='pending' or r['used'] or r['expires']<=ts():raise ValueError('Запрос недоступен.')
+    await state.set_state(None);await state.set_data(dict(action='claim_review',cid=cid,nonce=secrets.token_hex(6)))
+    d=await state.get_data()
+    await m.answer(details(b)+f"\nЗаявитель Telegram ID: {r['requester']}\nПроверьте его через известный вам контакт клиента. Подтверждение даст доступ к данным, отмене и переносу записи.",reply_markup=kb([[('Личность проверена — привязать','v4:claimok:'+d['nonce'])],[('Отклонить','v4:claimno:'+d['nonce'])],[('Отмена','home')]]))
+
+async def decide_claim(m,uid,state,approve,nonce):
+    d=await state.get_data()
+    if d.get('action')!='claim_review' or d.get('nonce')!=nonce:raise ValueError('Подтверждение устарело.')
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        c.row_factory=aiosqlite.Row;await c.execute('BEGIN IMMEDIATE')
+        r=await (await c.execute('SELECT c.*,i.booking,i.expires,i.used FROM v4_claims c JOIN v4_invites i ON i.hash=c.hash WHERE c.id=?',(d['cid'],))).fetchone()
+        b=await (await c.execute('SELECT * FROM bookings WHERE id=?',(r['booking'],))).fetchone() if r else None
+        active=await (await c.execute('SELECT id FROM masters WHERE id=? AND enabled=1',(uid,))).fetchone()
+        if not b or (uid!=MANAGER and (uid!=b['master'] or not active)):raise ValueError('Нет доступа.')
+        if r['status']!='pending' or r['used'] or r['expires']<=ts() or b['client'] is not None or b['status']!='active' or b['start']<=ts():raise ValueError('Запрос устарел.')
+        if approve:
+            await c.execute('UPDATE bookings SET client=?,reminder=? WHERE id=?',(r['requester'],int(b['start']-ts()<86400),b['id']))
+            await c.execute('UPDATE v4_invites SET used=1 WHERE booking=?',(b['id'],))
+            await c.execute("UPDATE v4_claims SET status='superseded' WHERE hash=? AND status='pending'",(r['hash'],))
+        await c.execute('UPDATE v4_claims SET status=? WHERE id=?',('approved' if approve else 'rejected',r['id']))
+        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'link_approved' if approve else 'link_rejected',b['id']))
+        await c.commit()
+    await state.clear();await m.answer('Привязка подтверждена.' if approve else 'Запрос отклонён.')
+    if approve:
+        current=await sql('SELECT * FROM bookings WHERE id=?',(b['id'],),True)
+        await _send3(r['requester'],'Запись привязана к вашему аккаунту.\n'+details(current),client_buttons(current))
+    else:await _send3(r['requester'],'Запрос привязки отклонён. Свяжитесь с салоном.')
+
+async def export_data(m,uid,all_data=False):
+    if all_data and uid!=MANAGER:raise ValueError('Нет доступа.')
+    query='SELECT * FROM bookings'+('' if all_data else ' WHERE client=?')+' ORDER BY start'
+    args=() if all_data else (uid,)
+    rows=await sql(query,args)
+    if all_data:
+        stream=io.StringIO();writer=csv.writer(stream)
+        cols=['id','master','service_name','start','end','name','phone','status','visit_state','confirmed']
+        writer.writerow(cols)
+        for b in rows:
+            values=[]
+            for col in cols:
+                val=fmt(b[col]) if col in ('start','end') else str(b[col] if b[col] is not None else '')
+                if val.startswith(('=','+','-','@','\t','\r')):val="'"+val
+                values.append(val)
+            writer.writerow(values)
+        payload=stream.getvalue().encode('utf-8-sig');name='bookings.csv'
+    else:
+        own_master=await sql('SELECT * FROM masters WHERE id=?',(uid,),True)
+        services=await sql('SELECT * FROM services WHERE master=?',(uid,))
+        # Do not export other clients' bookings to a master through the self-service endpoint.
+        requests=await sql('SELECT id,created,status FROM v4_delete_requests WHERE uid=?',(uid,))
+        payload=json.dumps(dict(telegram_id=uid,client_bookings=rows,master_profile=own_master,services=services,deletion_requests=requests),ensure_ascii=False,indent=2).encode('utf-8');name='my_data.json'
+    if len(payload)>45*1024*1024:raise ValueError('Выгрузка слишком большая. Требуется выгрузка администратором сервера по периодам.')
+    await m.answer_document(BufferedInputFile(payload,filename=name),caption='Конфиденциальные данные. Не публикуйте файл. Telegram сохраняет отправленные сообщения согласно своим правилам.')
+    await audit('export_all' if all_data else 'export_self')
+
+async def deletion_menu(m,uid):
+    if uid!=MANAGER:raise ValueError('Нет доступа.')
+    rows=await sql("SELECT * FROM v4_delete_requests WHERE status='pending' ORDER BY id LIMIT 50")
+    if not rows:return await m.answer('Нет запросов удаления.')
+    for r in rows:await m.answer(f"Запрос №{r['id']} · Telegram ID {r['uid']} · {fmt(r['created'])}",reply_markup=kb([[('Рассмотреть',f"v4:deletion:{r['id']}")]]))
+
+async def prepare_erasure(m,uid,state,request_id=None,bid=None):
+    if uid!=MANAGER:raise ValueError('Обезличивание подтверждает только управляющий.')
+    subject=None
+    if request_id:
+        r=await sql("SELECT * FROM v4_delete_requests WHERE id=? AND status='pending'",(request_id,),True)
+        if not r:raise ValueError('Запрос уже обработан.')
+        subject=r['uid'];where='client=?';args=[subject]
+    else:where='id=?';args=[bid]
+    count=await sql('SELECT COUNT(*) n FROM bookings WHERE '+where,args,True)
+    active=await sql("SELECT COUNT(*) n FROM bookings WHERE "+where+" AND status='active' AND end>?",args+[ts()],True)
+    nonce=secrets.token_hex(6)
+    await state.set_state(None);await state.set_data(dict(action='erase_confirm',request_id=request_id,bid=bid,subject=subject,nonce=nonce))
+    text=f"Записей найдено: {count['n']}. Действующих: {active['n']}.\nОбезличивание заменит имя и телефон в завершённых/отменённых записях и удалит связь с Telegram. Действующие записи НЕ изменяются.\nЭто не полное удаление из всех систем: профиль мастера, аудит, резервные копии и сообщения Telegram требуют отдельной проверки. Проверьте законные основания и сроки хранения перед подтверждением."
+    await m.answer(text,reply_markup=kb([[('Подтвердить обезличивание','v4:eraseok:'+nonce)],[('Отмена','home')]]))
+
+async def erase_confirm(m,uid,state,nonce):
+    d=await state.get_data()
+    if uid!=MANAGER or d.get('action')!='erase_confirm' or d.get('nonce')!=nonce:raise ValueError('Нет доступа или форма устарела.')
+    where='client=?' if d.get('subject') else 'id=?';args=[d['subject'] if d.get('subject') else d['bid']]
+    async with aiosqlite.connect(DB,timeout=30) as c:
+        await c.execute('BEGIN IMMEDIATE')
+        ids=[r[0] for r in await (await c.execute("SELECT id FROM bookings WHERE "+where+" AND (status<>'active' OR end<=?)",args+[ts()])).fetchall()]
+        for bid in ids:
+            await c.execute("UPDATE bookings SET name='[Удалено]',phone='',client=NULL WHERE id=?",(bid,))
+            await c.execute('DELETE FROM v4_claims WHERE hash IN (SELECT hash FROM v4_invites WHERE booking=?)',(bid,))
+            await c.execute('DELETE FROM v4_invites WHERE booking=?',(bid,))
+        if d.get('request_id'):
+            await c.execute("UPDATE v4_delete_requests SET status='review_required' WHERE id=?",(d['request_id'],))
+        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'anonymize_completed_bookings',d.get('bid') or 0))
+        await c.commit()
+    await state.clear();await m.answer(f'Обезличено записей: {len(ids)}. Действующие записи сохранены. Запрос не считается полностью исполненным: проверьте остальные места хранения и уведомите клиента.')
+    if d.get('subject'):await _send3(d['subject'],'Салон обработал завершённые/отменённые записи в рамках запроса удаления. Действующие записи и иные места хранения требуют отдельного рассмотрения. Для итогового ответа обратитесь к администратору.')
+
+async def dispatch(m,uid,k,state):
+    d=await state.get_data()
+    if k=='v3:search':
+        if uid!=MANAGER and not await master(uid):return
+        return await prompt(m,state,'search','Введите имя или часть телефона (без учёта регистра, скобок, пробелов и дефисов):')
+    if k=='v4:settings':
+        if uid!=MANAGER:return
+        return await m.answer('Настройки салона:',reply_markup=kb([[('Название','v4:setting:salon_name')],[('Контакт администратора','v4:setting:admin_contact')],[('Управление','manager')]]))
+    if k.startswith('v4:setting:'):
+        if uid!=MANAGER:return
+        key=k.split(':')[2]
+        if key not in ('salon_name','admin_contact'):return
+        return await prompt(m,state,'v4_setting','Введите '+('название салона (до 100 символов):' if key=='salon_name' else 'контакт администратора (до 300 символов):'),setting_key=key)
+    if k.startswith('v4:invite:'):return await invite(m,uid,int(k.split(':')[2]))
+    if k.startswith('v4:linkconfirm:'):return await create_claim(m,uid,state,k)
+    if k=='v4:claims':return await claims(m,uid)
+    if k.startswith('v4:claim:'):return await claim_card(m,uid,state,int(k.split(':')[2]))
+    if k.startswith(('v4:claimok:','v4:claimno:')):return await decide_claim(m,uid,state,k.startswith('v4:claimok:'),k.split(':')[2])
+    if k=='v4:export_self':return await export_data(m,uid)
+    if k=='v4:export_all':
+        if uid!=MANAGER:return
+        await state.set_state(None);await state.set_data(dict(action='export_confirm',nonce=secrets.token_hex(6)))
+        d=await state.get_data()
+        return await m.answer('Отправить в этот чат CSV со всеми записями и контактами клиентов? Не пересылайте файл посторонним.',reply_markup=kb([[('Подтвердить','v4:exportok:'+d['nonce'])],[('Отмена','home')]]))
+    if k.startswith('v4:exportok:'):
+        if uid!=MANAGER or d.get('action')!='export_confirm' or d.get('nonce')!=k.split(':')[2]:raise ValueError('Форма устарела.')
+        await state.clear();return await export_data(m,uid,True)
+    if k=='v4:delete_request':
+        await state.set_state(None);await state.set_data(dict(action='delete_request',nonce=secrets.token_hex(6)))
+        d=await state.get_data()
+        return await m.answer('Отправить управляющему запрос на удаление ваших данных? Это не отменяет записи и не удаляет данные автоматически.',reply_markup=kb([[('Отправить запрос','v4:deleteask:'+d['nonce'])],[('Отмена','home')]]))
+    if k.startswith('v4:deleteask:'):
+        if d.get('action')!='delete_request' or d.get('nonce')!=k.split(':')[2]:raise ValueError('Форма устарела.')
+        r=await sql("SELECT id FROM v4_delete_requests WHERE uid=? AND status IN ('pending','review_required')",(uid,),True)
+        if not r:await sql('INSERT INTO v4_delete_requests(uid,created) VALUES(?,?)',(uid,ts()))
+        await state.clear();await m.answer('Запрос зарегистрирован. Для уточнения сроков свяжитесь с администратором.')
+        await _send3(MANAGER,f'Запрос удаления данных от Telegram ID {uid}. Рассмотрите в кабинете.',kb([[('Запросы','v4:deletions')]]));return
+    if k=='v4:deletions':return await deletion_menu(m,uid)
+    if k.startswith('v4:deletion:'):return await prepare_erasure(m,uid,state,request_id=int(k.split(':')[2]))
+    if k.startswith('v4:erasebooking:'):
+        bid=int(k.split(':')[2]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+        if not await access_booking(uid,b,True):raise ValueError('Нет доступа.')
+        if uid!=MANAGER:
+            await _send3(MANAGER,f'Мастер запросил проверку удаления контактов записи №{bid}.',kb([[('Проверить',f'v4:erasebooking:{bid}')]]))
+            return await m.answer('Запрос передан управляющему. Данные пока не изменены.')
+        return await prepare_erasure(m,uid,state,bid=bid)
+    if k.startswith('v4:eraseok:'):return await erase_confirm(m,uid,state,k.split(':')[2])
+    if k.startswith('v4:audit:'):
+        if uid!=MANAGER:return
+        page=max(0,int(k.split(':')[2]));rows=await sql('SELECT * FROM v4_audit ORDER BY id DESC LIMIT 16 OFFSET ?',(page*15,))
+        text='Журнал действий (ID пользователя / действие / объект):\n'+'\n'.join(f"{fmt(r['at'])} · {r['actor']} · {r['event']} · {r['object_id']}" for r in rows[:15])
+        buttons=[]
+        if page:buttons.append(('←',f'v4:audit:{page-1}'))
+        if len(rows)>15:buttons.append(('→',f'v4:audit:{page+1}'))
+        return await m.answer(text[:3900],reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager')]]))
+    # Capture events only after the original operation has actually changed the database.
+    before=None;bid=None
+    if k.startswith(('cancelok:','status:')):
+        bid=int(k.split(':')[1]);before=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+    if k=='v3:wizard_save' and d.get('wizard')=='contacts':
+        bid=d.get('bid');before=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+    rights_before=None
+    if k.startswith('v3:rightok:') and d.get('mid'):
+        rights_before=await sql('SELECT enabled FROM masters WHERE id=?',(d['mid'],),True)
+    result=await _dispatch3(m,uid,k,state)
+    if before:
+        after=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+        if after and any(before.get(x)!=after.get(x) for x in ('status','visit_state','name','phone')):await audit('booking_changed',bid)
+    if rights_before:
+        after=await sql('SELECT enabled FROM masters WHERE id=?',(d['mid'],),True)
+        if after and after!=rights_before:
+            await audit('rights_restored' if after['enabled'] else 'rights_revoked',d['mid'])
+            if not after['enabled']:
+                await sql('UPDATE v4_invites SET used=1 WHERE issuer=?',(d['mid'],))
+    return result
+
+@dp.message(Command('start','cancel'))
+async def start_v4(m:Message,state:FSMContext):
+    parts=(m.text or '').split(maxsplit=1)
+    if len(parts)==2 and parts[1].startswith('bind_'):
+        return await link_start(m,state,parts[1][5:])
+    await home(m,m.from_user.id,state)
+
+async def input_v4(m:Message,state:FSMContext):
+    d=await state.get_data();uid=m.from_user.id
+    if d.get('action')=='v4_setting':
+        if uid!=MANAGER:return
+        text=(m.text or '').strip();limit=100 if d['setting_key']=='salon_name' else 300
+        if not 1<=len(text)<=limit:return await m.answer(f'Введите текст от 1 до {limit} символов.')
+        await sql('INSERT OR REPLACE INTO v4_settings(key,value) VALUES(?,?)',(d['setting_key'],text))
+        await audit('setting_changed');await state.clear();await m.answer('Настройка сохранена.')
+        return await dispatch(m,uid,'v4:settings',state)
+    await _input3(m,state)
+
+async def fallback_v4(m:Message,state:FSMContext):await fallback_v3(m,state)
+
+async def reminders():
+    while True:
+        try:
+            rows=await sql("SELECT * FROM bookings WHERE status='active' AND visit_state='expected' AND reminder=0 AND start>? AND start<=?",(ts(),ts()+86400))
+            for b in rows:
+                current=await sql("SELECT * FROM bookings WHERE id=? AND start=? AND reminder=0 AND status='active' AND visit_state='expected'",(b['id'],b['start']),True)
+                if not current:continue
+                result=await _send3(b['client'],'Напоминание о визите\n'+details(current),client_buttons(current))
+                key=(b['id'],b['start'])
+                if result=='ok':
+                    await sql('UPDATE bookings SET reminder=1 WHERE id=? AND start=?',key)
+                    await audit('reminder_sent',b['id'],0)
+                else:
+                    await sql('INSERT OR IGNORE INTO v4_delivery(booking,start) VALUES(?,?)',key)
+                    if result!='skip':await sql('UPDATE v4_delivery SET attempts=attempts+1 WHERE booking=? AND start=?',key)
+                    r=await sql('SELECT * FROM v4_delivery WHERE booking=? AND start=?',key,True)
+                    if result in ('permanent','skip') or r['attempts']>=3:
+                        # A missing Telegram binding is also visible to the manager.
+                        if not r['alerted']:
+                            alert=await _send3(MANAGER,f"Напоминание по записи №{b['id']} не доставлено. "+('Нет привязки к Telegram.' if result=='skip' else 'Проверьте контакт клиента и свяжитесь самостоятельно.'))
+                            if alert=='ok':await sql('UPDATE v4_delivery SET alerted=1 WHERE booking=? AND start=?',key)
+                        if r['alerted'] or alert=='ok':
+                            await sql('UPDATE bookings SET reminder=1 WHERE id=? AND start=?',key)
+                            await audit('reminder_failed',b['id'],0)
+                await asyncio.sleep(.1)
+        except Exception as e:logging.error('Reminder loop: %s',type(e).__name__)
+        await asyncio.sleep(30)
+
+
+# ---- Salon v4 portfolio ----
+class PortfolioForm(StatesGroup):
+    photo = State()
+
+_pf_initialize = initialize
+_pf_dispatch = dispatch
+_pf_cabinet = cabinet
+_pf_master_card = master_card
+_pf_services = select_services
+_pf_back = back
+PF_LIMIT = 30
+
+async def initialize():
+    await _pf_initialize()
+    async with aiosqlite.connect(DB, timeout=30) as c:
+        await c.executescript("""
+        CREATE TABLE IF NOT EXISTS v4_portfolio(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            master INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            file_unique_id TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            created INTEGER NOT NULL,
+            UNIQUE(master,file_unique_id)
+        );
+        CREATE INDEX IF NOT EXISTS v4_portfolio_master ON v4_portfolio(master,id);
+        """)
+        await c.commit()
+
+async def pf_permission(uid, mid, edit=False):
+    p = await sql('SELECT * FROM masters WHERE id=?', (mid,), True)
+    if not p:
+        raise ValueError('Мастер не найден.')
+    if edit:
+        if uid != MANAGER and not (uid == mid and p['enabled']):
+            raise ValueError('Нет доступа к управлению портфолио.')
+    elif not p['enabled']:
+        raise ValueError('Портфолио этого мастера недоступно.')
+    return p
+
+async def cabinet(m, uid, state, kind):
+    await _pf_cabinet(m, uid, state, kind)
+    if kind == 'staff' and await master(uid):
+        await m.answer('Работы мастера:', reply_markup=kb([
+            [('Моё портфолио', f'pf:edit:{uid}:0')]
+        ]))
+
+async def master_card(m, mid):
+    await _pf_master_card(m, mid)
+    await m.answer('Работы мастера:', reply_markup=kb([
+        [('Портфолио мастера', f'pf:edit:{mid}:0')]
+    ]))
+
+async def select_masters(m, state, manual=False):
+    await state.clear()
+    await state.update_data(manual=manual)
+    items = []
+    for p in await sql('SELECT * FROM masters WHERE enabled=1 ORDER BY name'):
+        if all(await ready(p['id'])):
+            items.append(p)
+    if not items:
+        return await m.answer('Пока нет мастеров, готовых к записи.', reply_markup=kb([[('Главное меню','home')]]))
+    for i in range(0, len(items), 15):
+        rows = []
+        for p in items[i:i+15]:
+            rows.append([(p['name'], f"master:{p['id']}")])
+            rows.append([('Портфолио мастера', f"pf:view:{p['id']}:0")])
+        await m.answer('Выберите мастера. Под каждым именем — его портфолио:', reply_markup=kb(rows))
+
+async def select_services(m, state, mid):
+    await _pf_services(m, state, mid)
+    if await master(mid):
+        await m.answer('Перед выбором услуги можно посмотреть работы:', reply_markup=kb([
+            [('Портфолио мастера', f'pf:view:{mid}:0')]
+        ]))
+
+async def pf_show(m, uid, mid, page=0, edit=False):
+    p = await pf_permission(uid, mid, edit)
+    count = await sql('SELECT COUNT(*) n FROM v4_portfolio WHERE master=?', (mid,), True)
+    page = max(0, min(page, max(0, count['n']-1)))
+    r = await sql('SELECT * FROM v4_portfolio WHERE master=? ORDER BY id DESC LIMIT 1 OFFSET ?', (mid,page), True)
+    mode = 'edit' if edit else 'view'
+    rows = []
+    if r:
+        nav = []
+        if page:
+            nav.append(('←', f'pf:{mode}:{mid}:{page-1}'))
+        if page+1 < count['n']:
+            nav.append(('→', f'pf:{mode}:{mid}:{page+1}'))
+        if nav:
+            rows.append(nav)
+        if edit:
+            rows.append([('Удалить фото', f"pf:delete:{r['id']}")])
+    if edit:
+        # Managers may remove any work; only an enabled owner uploads.
+        if uid == mid and p['enabled']:
+            rows.append([('Добавить фото', f'pf:add:{mid}')])
+        rows.append([('Назад', f'v3:master:{mid}' if uid==MANAGER else 'staff')])
+    else:
+        rows.append([('Выбрать этого мастера', f'master:{mid}')])
+        rows.append([('Вернуться к записи', f'pf:return:{mid}')])
+    title = 'Портфолио · ' + (p['name'] or 'Мастер')
+    if not r:
+        return await m.answer(title+'\nФотографий пока нет.', reply_markup=kb(rows))
+    caption = title + f"\nФото {page+1} из {count['n']}"
+    if r['caption']:
+        caption += '\n' + r['caption']
+    try:
+        await m.answer_photo(r['file_id'], caption=caption, reply_markup=kb(rows))
+    except TelegramBadRequest:
+        await m.answer(title+'\nНе удалось показать фотографию. Попробуйте позже; мастер может удалить её и загрузить заново.', reply_markup=kb(rows))
+
+async def pf_delete(m, uid, state, nonce):
+    d = await state.get_data()
+    pending = d.get('pf_delete') or {}
+    if pending.get('nonce') != nonce:
+        raise ValueError('Подтверждение устарело.')
+    async with aiosqlite.connect(DB, timeout=30) as c:
+        c.row_factory = aiosqlite.Row
+        await c.execute('BEGIN IMMEDIATE')
+        r = await (await c.execute('SELECT p.*,m.enabled FROM v4_portfolio p JOIN masters m ON m.id=p.master WHERE p.id=?', (pending['id'],))).fetchone()
+        if not r:
+            raise ValueError('Фотография уже удалена.')
+        if uid != MANAGER and not (uid == r['master'] and r['enabled']):
+            raise ValueError('Нет прав на удаление.')
+        await c.execute('DELETE FROM v4_portfolio WHERE id=?', (r['id'],))
+        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)', (ts(),uid,'portfolio_deleted',r['id']))
+        await c.commit()
+    await state.update_data(pf_delete=None)
+    await m.answer('Фото удалено из портфолио. Ранее отправленные сообщения и резервные копии автоматически не удаляются.')
+    await pf_show(m, uid, r['master'], edit=True)
+
+async def dispatch(m, uid, k, state):
+    if not k.startswith('pf:'):
+        return await _pf_dispatch(m, uid, k, state)
+    parts = k.split(':')
+    action = parts[1]
+    if action in ('view','edit'):
+        mid, page = int(parts[2]), int(parts[3])
+        if action == 'edit':
+            await pf_permission(uid, mid, True)
+            await state.clear()
+        # Public browsing does not change booking state.
+        return await pf_show(m, uid, mid, page, action=='edit')
+    if action == 'return':
+        mid = int(parts[2]); d = await state.get_data()
+        if d.get('mid') == mid:
+            if d.get('action') in ('date','name','phone','confirm'):
+                await m.answer('Портфолио закрыто. Продолжите запись с прежними кнопками или сообщениями выше. Данные формы сохранены.')
+                return
+            return await select_services(m, state, mid)
+        return await select_masters(m, state, bool(d.get('manual')))
+    if action == 'add':
+        mid = int(parts[2])
+        await pf_permission(uid, mid, True)
+        if uid != mid or not await master(uid):
+            raise ValueError('Загружать работы может только действующий мастер в своё портфолио.')
+        await state.set_state(PortfolioForm.photo)
+        await state.set_data(dict(action='portfolio_upload', pf_mid=mid))
+        return await m.answer('Отправьте фотографию как фото, не как документ. Можно добавить подпись до 500 символов. После сохранения можно отправить следующую. Максимум 30 фото.\nПубликуйте только свои работы с необходимыми разрешениями людей на фото. Не размещайте контакты клиентов. Для завершения нажмите «Готово».', reply_markup=kb([[('Готово',f'pf:edit:{mid}:0')],[('Отмена','staff')]]))
+    if action == 'delete':
+        r = await sql('SELECT * FROM v4_portfolio WHERE id=?',(int(parts[2]),),True)
+        if not r:
+            raise ValueError('Фото уже удалено.')
+        await pf_permission(uid,r['master'],True)
+        nonce = secrets.token_hex(8)
+        await state.update_data(pf_delete=dict(id=r['id'],nonce=nonce))
+        return await m.answer('Удалить эту фотографию из портфолио?', reply_markup=kb([
+            [('Да, удалить','pf:deleteok:'+nonce)],
+            [('Не удалять',f"pf:edit:{r['master']}:0")]
+        ]))
+    if action == 'deleteok':
+        return await pf_delete(m,uid,state,parts[2])
+    raise ValueError('Неизвестное действие портфолио.')
+
+async def back(m, uid, state):
+    if (await state.get_data()).get('action') == 'portfolio_upload':
+        return await cabinet(m, uid, state, 'staff') if await master(uid) else await home(m,uid,state)
+    return await _pf_back(m,uid,state)
+
+@dp.message(PortfolioForm.photo)
+async def portfolio_input(m:Message, state:FSMContext):
+    uid = m.from_user.id
+    try:
+        d = await state.get_data()
+        if d.get('action') != 'portfolio_upload' or d.get('pf_mid') != uid or not await master(uid):
+            await state.clear()
+            return await m.answer('Загрузка недоступна. Откройте кабинет заново.')
+        if not m.photo:
+            return await m.answer('Нужно фото, отправленное как фотография, а не файл. Для выхода нажмите «Отмена» или «Главное меню».')
+        caption = (m.caption or '').strip()
+        if len(caption)>500:
+            return await m.answer('Подпись слишком длинная. Отправьте фото ещё раз с подписью до 500 символов.')
+        photo = m.photo[-1]
+        async with aiosqlite.connect(DB,timeout=30) as c:
+            await c.execute('BEGIN IMMEDIATE')
+            active = await (await c.execute('SELECT id FROM masters WHERE id=? AND enabled=1',(uid,))).fetchone()
+            if not active:
+                raise ValueError('Права мастера отозваны.')
+            duplicate = await (await c.execute('SELECT id FROM v4_portfolio WHERE master=? AND file_unique_id=?',(uid,photo.file_unique_id))).fetchone()
+            if duplicate:
+                raise ValueError('Эта фотография уже есть в портфолио.')
+            count = (await (await c.execute('SELECT COUNT(*) FROM v4_portfolio WHERE master=?',(uid,))).fetchone())[0]
+            if count >= PF_LIMIT:
+                raise ValueError('Достигнут лимит 30 фото. Сначала удалите ненужное.')
+            cur = await c.execute('INSERT INTO v4_portfolio(master,file_id,file_unique_id,caption,created) VALUES(?,?,?,?,?)',(uid,photo.file_id,photo.file_unique_id,caption,ts()))
+            await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'portfolio_added',cur.lastrowid))
+            await c.commit()
+        await m.answer(f'Фото сохранено ({count+1}/{PF_LIMIT}). Отправьте следующее или нажмите «Готово».', reply_markup=kb([[('Готово',f'pf:edit:{uid}:0')]]))
+    except (ValueError,OverflowError) as e:
+        await m.answer(str(e))
+
+# Preserve v4 text/fallback handlers, registering them after the photo state.
+dp.message.register(input_v4, Form.text)
+dp.message.register(fallback_v4)
+
 if __name__=='__main__':asyncio.run(main())
+
 
