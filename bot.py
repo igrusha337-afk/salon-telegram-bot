@@ -145,7 +145,21 @@ async def select_services(m,state,mid):
     await state.update_data(mid=mid,wizard=None)
     rows=await sql('SELECT * FROM services WHERE master=? AND active=1',(mid,))
     if not rows:return await m.answer('У мастера пока нет услуг.')
-    await m.answer(p['name']+'\n'+p['bio'])
+    profile_text=p['name']+'\n'+p['bio']
+    photo_sent=False
+    if not (await state.get_data()).get('manual'):
+        photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(mid,),True)
+        if photo:
+            try:
+                if len(profile_text)<=1024:
+                    await m.answer_photo(photo['file_id'],caption=profile_text)
+                    photo_sent=True
+                else:
+                    await m.answer_photo(photo['file_id'])
+            except TelegramBadRequest:
+                logging.warning('Profile photo unavailable for master %s',mid)
+    if not photo_sent:
+        await m.answer(profile_text)
     for i in range(0,len(rows),30):
         await m.answer('Услуги:',reply_markup=kb([[(r['name']+f" · {r['minutes']} мин"+(f" · {r['price']} ₽" if r['price'] else ''),f"service:{r['id']}")] for r in rows[i:i+30]]))
 async def dates(m,state):
@@ -1428,6 +1442,21 @@ async def start_v4(m:Message,state:FSMContext):
 
 async def input_v4(m:Message,state:FSMContext):
     d=await state.get_data();uid=m.from_user.id
+    if d.get('action')=='profile_photo_upload':
+        if not await master(uid):
+            await state.clear()
+            return await m.answer('Нет прав мастера.')
+        if not m.photo:
+            return await m.answer('Отправьте фотографию как фото, а не как файл.')
+        saved=await sql(
+            'INSERT OR REPLACE INTO v4_master_photos(master,file_id) '
+            'SELECT id,? FROM masters WHERE id=? AND enabled=1 RETURNING master',
+            (m.photo[-1].file_id,uid),True,
+        )
+        await state.clear()
+        if not saved:
+            return await m.answer('Нет прав мастера.')
+        return await profile_photo_menu(m,uid)
     if d.get('action')=='v4_contact_add':
         if uid not in MANAGERS:return
         text=(m.text or '').strip()
@@ -1489,6 +1518,10 @@ async def initialize():
     await _pf_initialize()
     async with aiosqlite.connect(DB, timeout=30) as c:
         await c.executescript("""
+        CREATE TABLE IF NOT EXISTS v4_master_photos(
+            master INTEGER PRIMARY KEY,
+            file_id TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS v4_portfolio(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             master INTEGER NOT NULL,
@@ -1516,7 +1549,8 @@ async def pf_permission(uid, mid, edit=False):
 async def cabinet(m, uid, state, kind):
     await _pf_cabinet(m, uid, state, kind)
     if kind == 'staff' and await master(uid):
-        await m.answer('Работы мастера:', reply_markup=kb([
+        await m.answer('Фото и портфолио:', reply_markup=kb([
+            [('Моё фото','profilephoto:menu')],
             [('Моё портфолио', f'pf:edit:{uid}:0')]
         ]))
 
@@ -1588,7 +1622,41 @@ async def pf_delete(m, uid, state, nonce):
     await m.answer('Фото удалено из портфолио. Ранее отправленные сообщения и резервные копии автоматически не удаляются.')
     await pf_show(m, uid, r['master'], edit=True)
 
+async def profile_photo_menu(m, uid):
+    photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(uid,),True)
+    rows=[[('Заменить фото' if photo else 'Добавить фото','profilephoto:add')]]
+    if photo:
+        rows.append([('Удалить фото','profilephoto:delete')])
+    rows.append([('В кабинет','staff')])
+    if photo:
+        try:
+            return await m.answer_photo(photo['file_id'],caption='Моё фото',reply_markup=kb(rows))
+        except TelegramBadRequest:
+            pass
+    await m.answer('Моё фото',reply_markup=kb(rows))
+
+
 async def dispatch(m, uid, k, state):
+    if k.startswith('profilephoto:'):
+        if not await master(uid):
+            raise ValueError('Нет прав мастера.')
+        if k.startswith('profilephoto:confirm:'):
+            pending=(await state.get_data()).get('profile_photo_delete')
+            if not pending or pending['nonce']!=k.split(':')[2]:
+                raise ValueError('Подтверждение устарело.')
+            await sql('DELETE FROM v4_master_photos WHERE master=? AND file_id=? AND EXISTS(SELECT 1 FROM masters WHERE id=? AND enabled=1)',(uid,pending['file_id'],uid))
+        await state.clear()
+        if k=='profilephoto:add':
+            return await prompt(m,state,'profile_photo_upload','Отправьте фотографию как фото.')
+        if k=='profilephoto:delete':
+            photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(uid,),True)
+            if photo:
+                nonce=secrets.token_hex(6)
+                await state.update_data(profile_photo_delete=dict(file_id=photo['file_id'],nonce=nonce))
+                return await m.answer('Удалить фото профиля?',reply_markup=kb([
+                    [('Да, удалить',f'profilephoto:confirm:{nonce}')],[('Отмена','profilephoto:menu')]
+                ]))
+        return await profile_photo_menu(m,uid)
     if not k.startswith('pf:'):
         return await _pf_dispatch(m, uid, k, state)
     parts = k.split(':')
@@ -1632,6 +1700,8 @@ async def dispatch(m, uid, k, state):
     raise ValueError('Неизвестное действие портфолио.')
 
 async def back(m, uid, state):
+    if (await state.get_data()).get('action') == 'profile_photo_upload':
+        return await dispatch(m, uid, 'profilephoto:menu', state)
     if (await state.get_data()).get('action') == 'portfolio_upload':
         return await cabinet(m, uid, state, 'staff') if await master(uid) else await home(m,uid,state)
     return await _pf_back(m,uid,state)
