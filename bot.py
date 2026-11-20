@@ -85,6 +85,9 @@ async def initialize():
         CREATE TABLE IF NOT EXISTS v2_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         """)
         await c.execute('BEGIN IMMEDIATE')
+        master_columns=[x[1] for x in await (await c.execute('PRAGMA table_info(masters)')).fetchall()]
+        if 'experience' not in master_columns:
+            await c.execute("ALTER TABLE masters ADD COLUMN experience TEXT NOT NULL DEFAULT ''")
         cols=[x[1] for x in await (await c.execute('PRAGMA table_info(bookings)')).fetchall()]
         if 'visit_state' not in cols: await c.execute("ALTER TABLE bookings ADD COLUMN visit_state TEXT NOT NULL DEFAULT 'expected'")
         if 'confirmed' not in cols: await c.execute('ALTER TABLE bookings ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0')
@@ -145,7 +148,12 @@ async def select_services(m,state,mid):
     await state.update_data(mid=mid,wizard=None)
     rows=await sql('SELECT * FROM services WHERE master=? AND active=1',(mid,))
     if not rows:return await m.answer('У мастера пока нет услуг.')
-    profile_text=p['name']+'\n'+p['bio']
+    profile_lines=[p['name']]
+    if p['experience']:
+        profile_lines.append('Стаж: '+p['experience'])
+    if p['bio']:
+        profile_lines.append(p['bio'])
+    profile_text='\n\n'.join(profile_lines)
     photo_sent=False
     if not (await state.get_data()).get('manual'):
         photo=await sql('SELECT file_id FROM v4_master_photos WHERE master=?',(mid,),True)
@@ -748,7 +756,7 @@ async def back(m,uid,state):
     d=await state.get_data();a=d.get('action','')
     wizard=d.get('wizard')
     if wizard:
-        stages={'profile':['name','bio','review'],'service':['name','minutes','price','review'],'contacts':['name','phone','review']}
+        stages={'profile':['name','experience','bio','review'],'service':['name','minutes','price','review'],'contacts':['name','phone','review']}
         seq=stages[wizard];idx=seq.index(d['stage'])
         if idx:return await wizard_step(m,state,wizard,seq[idx-1])
         return await dispatch(m,uid,'services' if wizard=='service' else 'staff' if wizard=='profile' else 'home',state)
@@ -767,13 +775,16 @@ async def wizard_step(m,state,kind,stage):
     d=await state.get_data();rows=[]
     if stage=='review':
         await state.set_state(None)
-        if kind=='profile':text=f"Имя: {d['wname']}\nСпециализация: {d.get('wbio','')}"
+        if kind=='profile':text=f"Имя: {d['wname']}\nСтаж: {d.get('wexperience') or 'не указан'}\nО себе: {d.get('wbio') or 'не заполнено'}"
         elif kind=='service':text=f"Услуга: {d['wname']}\nДлительность: {d['wminutes']} мин\nЦена: {d['wprice'] or 'без цены'}"
         else:text=f"Имя: {d['wname']}\nТелефон: {d['wphone']}"
         rows.append([('Сохранить','v3:wizard_save')])
     else:
-        text={'name':'Введите имя:' if kind!='service' else 'Введите название услуги:','bio':'Укажите специализацию / описание:','minutes':'Введите длительность в минутах (5–720):','price':'Введите цену или выберите «Без цены»:','phone':'Введите телефон (10–15 цифр):'}[stage]
-        if stage in ('bio','price'):rows.append([('Без описания' if stage=='bio' else 'Без цены','v3:skip')])
+        text={'name':'Введите имя:' if kind!='service' else 'Введите название услуги:','experience':'Укажите стаж, например «7 лет» (до 50 символов):','bio':'Кратко расскажите о себе и своей специализации (до 500 символов):','minutes':'Введите длительность в минутах (5–720):','price':'Введите цену или выберите «Без цены»:','phone':'Введите телефон (10–15 цифр):'}[stage]
+        if stage in ('experience','bio','price'):
+            rows.append([({'experience':'Без стажа','bio':'Без описания','price':'Без цены'}[stage],'v3:skip')])
+        if stage in ('experience','bio') and d.get('w'+stage):
+            rows.append([('Оставить текущее значение','v3:profile_keep:'+stage)])
     rows.append([('Назад','v3:back'),('Отмена','home')])
     await m.answer(text,reply_markup=kb(rows))
 
@@ -786,7 +797,11 @@ async def wizard_value(m,uid,state,text):
     if stage=='name':
         if not 1<=len(text)<= (100 if kind=='contacts' else 80):raise ValueError('Недопустимая длина имени/названия.')
         await state.update_data(wname=text)
-        return await wizard_step(m,state,kind,{'profile':'bio','service':'minutes','contacts':'phone'}[kind])
+        return await wizard_step(m,state,kind,{'profile':'experience','service':'minutes','contacts':'phone'}[kind])
+    if stage=='experience':
+        if len(text)>50:raise ValueError('Стаж до 50 символов.')
+        await state.update_data(wexperience='' if text=='-' else text)
+        return await wizard_step(m,state,kind,'bio')
     if stage=='bio':
         if len(text)>500:raise ValueError('Описание до 500 символов.')
         await state.update_data(wbio='' if text=='-' else text)
@@ -809,7 +824,7 @@ async def wizard_save(m,uid,state):
     if d.get('stage')!='review':raise ValueError('Форма устарела.')
     if kind in ('profile','service') and not await master(uid):raise ValueError('Нет прав мастера.')
     if kind=='profile':
-        await sql('UPDATE masters SET name=?,bio=? WHERE id=? AND enabled=1',(d['wname'],d['wbio'],uid))
+        await sql('UPDATE masters SET name=?,bio=?,experience=? WHERE id=? AND enabled=1',(d['wname'],d['wbio'],d['wexperience'],uid))
         await m.answer('Профиль сохранён.');await cabinet(m,uid,state,'staff');return await readiness(m,uid)
     if kind=='service':
         if d.get('sid'):await sql('UPDATE services SET name=?,minutes=?,price=? WHERE id=? AND master=?',(d['wname'],d['wminutes'],d['wprice'],d['sid'],uid))
@@ -1013,12 +1028,21 @@ async def dispatch(m,uid,k,state):
     if k=='profile' or k=='addservice' or k.startswith('edit:'):
         if not await master(uid):return
         await state.clear()
-        if k=='profile':return await wizard_step(m,state,'profile','name')
+        if k=='profile':
+            profile=await master(uid)
+            if not profile:return
+            await state.update_data(wexperience=profile['experience'],wbio=profile['bio'])
+            return await wizard_step(m,state,'profile','name')
         sid=int(k.split(':')[1]) if ':' in k else 0
         if sid and not await sql('SELECT id FROM services WHERE id=? AND master=?',(sid,uid),True):return
         await state.update_data(sid=sid);return await wizard_step(m,state,'service','name')
+    if k.startswith('v3:profile_keep:'):
+        stage=k.rsplit(':',1)[-1]
+        if d.get('wizard')=='profile' and stage in ('experience','bio') and d.get('stage')==stage and d.get('w'+stage):
+            return await wizard_value(m,uid,state,d['w'+stage])
+        return
     if k=='v3:skip':
-        if d.get('wizard') and d.get('stage') in ('bio','price'):return await wizard_value(m,uid,state,'-')
+        if d.get('wizard') and d.get('stage') in ('experience','bio','price'):return await wizard_value(m,uid,state,'-')
         return
     if k=='v3:wizard_save':return await wizard_save(m,uid,state)
     if k.startswith(('v3:copyweek:', 'v3:copyconfirm:')):
