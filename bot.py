@@ -1505,7 +1505,7 @@ async def master_card(m, mid):
 
 async def select_services(m, state, mid):
     await _pf_services(m, state, mid)
-    if await master(mid):
+    if not (await state.get_data()).get('manual') and await master(mid):
         await m.answer('Перед выбором услуги можно посмотреть работы:', reply_markup=kb([
             [('Портфолио мастера', f'pf:view:{mid}:0')]
         ]))
