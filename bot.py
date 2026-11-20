@@ -25,6 +25,11 @@ if not TOKEN or TOKEN=='replace_me': raise SystemExit('Настройка BOT_TO
 raw=os.getenv('MANAGER_ID','').strip()
 if not raw.isdecimal() or int(raw)<=0: raise SystemExit('MANAGER_ID должен быть числовым Telegram ID, не username. Временно укажите 1, затем узнайте свой ID командой /id.')
 MANAGER=int(raw)
+additional_managers=os.getenv('ADDITIONAL_MANAGER_IDS','').strip()
+manager_ids=[value.strip() for value in additional_managers.split(',')] if additional_managers else []
+if any(not value.isdecimal() or int(value)<=0 for value in manager_ids):
+    raise SystemExit('ADDITIONAL_MANAGER_IDS должен содержать положительные числовые Telegram ID через запятую.')
+MANAGERS=frozenset({MANAGER, *(int(value) for value in manager_ids)})
 DATA_DIR=Path(os.getenv('DATA_DIR') or '.')
 DB=Path(os.getenv('DB_PATH') or DATA_DIR/'salon.sqlite3').expanduser().resolve()
 BACKUPS=Path(os.getenv('BACKUP_DIR',str(DB.parent/'backups'))).expanduser().resolve()
@@ -119,7 +124,7 @@ async def home(m,uid,state):
     await state.clear()
     rows=[[('Записаться','book')],[('Мои записи','my')]]
     if await master(uid): rows.append([('Кабинет мастера','staff')])
-    if uid==MANAGER: rows.append([('Управление салоном','manager')])
+    if uid in MANAGERS: rows.append([('Управление салоном','manager')])
     await m.answer('Журнал салона · версия 2 · МСК',reply_markup=kb(rows))
 
 async def start(m:Message,state:FSMContext): await home(m,m.from_user.id,state)
@@ -196,7 +201,7 @@ async def save(uid,d):
         old=None
         if d.get('move'):
             old=await (await c.execute("SELECT * FROM bookings WHERE id=? AND status='active' AND visit_state='expected' AND start>?",(d['move'],ts()))).fetchone()
-            if not old or uid not in (old['client'],old['master'],MANAGER):raise ValueError('Нет доступа к переносу.')
+            if not old or uid not in MANAGERS and uid not in (old['client'],old['master']):raise ValueError('Нет доступа к переносу.')
             if old['start']!=d['original']:raise ValueError('Запись уже изменена. Откройте её заново через /start.')
             s=dict(id=old['service'],master=old['master'],name=old['service_name'],price=old['price'],minutes=(old['end']-old['start'])//60)
         else:
@@ -205,8 +210,8 @@ async def save(uid,d):
         enabled_row=await (await c.execute('SELECT enabled FROM masters WHERE id=?',(s['master'],))).fetchone()
         active_master=bool(enabled_row and enabled_row['enabled'])
         if not old and not active_master:raise ValueError('Мастер недоступен для новых записей.')
-        if old and uid!=MANAGER and uid!=old['client'] and not active_master:raise ValueError('Права мастера отозваны.')
-        if d.get('manual') and uid!=MANAGER and (uid!=s['master'] or not active_master):raise ValueError('Нет прав.')
+        if old and uid not in MANAGERS and uid!=old['client'] and not active_master:raise ValueError('Права мастера отозваны.')
+        if d.get('manual') and uid not in MANAGERS and (uid!=s['master'] or not active_master):raise ValueError('Нет прав.')
         if not old and not d.get('manual'):
             count=await (await c.execute("SELECT COUNT(*) FROM bookings WHERE client=? AND status='active' AND end>?",(uid,ts()))).fetchone()
             if count[0]>=MAX_ACTIVE:raise ValueError(f'Достигнут лимит активных записей: {MAX_ACTIVE}. Отмените ненужную запись или свяжитесь с салоном.')
@@ -221,11 +226,10 @@ async def save(uid,d):
             await c.execute('UPDATE bookings SET start=?,end=?,reminder=?,confirmed=0 WHERE id=?',(t,end,rem,old['id'])); bid=old['id']
         else:
             cur=await c.execute('INSERT INTO bookings(master,service,service_name,price,start,end,client,name,phone,reminder) VALUES(?,?,?,?,?,?,?,?,?,?)',(s['master'],s['id'],s['name'],s['price'],t,end,None if d.get('manual') else uid,d['name'],d['phone'],rem));bid=cur.lastrowid
-        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'booking_moved' if old else 'booking_created',bid))
         await c.commit();return bid
 
 async def listing(m,uid,scope,period):
-    if scope=='manager' and uid!=MANAGER:return
+    if scope=='manager' and uid not in MANAGERS:return
     if scope=='staff' and not await master(uid):return
     base='SELECT b.*,m.name AS master_name FROM bookings b JOIN masters m ON m.id=b.master WHERE '
     if scope=='client':q=base+"b.client=? AND b.status='active' AND b.start>?"; args=[uid,ts()]
@@ -261,6 +265,7 @@ async def target_menu(m,state,uid,target):
     if target.startswith('d:') and not r:text='Используется недельный график. Добавление создаст отдельный график этой даты.'
     rows=[[('Добавить интервал','interval_add')],[('Сделать выходным','off')]]
     for i,w in enumerate(ws):rows.append([(f'Удалить {w[0]}–{w[1]}',f'interval_del:{i}')])
+    if target.startswith('w:') and ws:rows.append([('Копировать на другой день',f'v3:copyweek:{target[2:]}')])
     if target.startswith('d:'):rows.append([('Вернуть недельный график','reset')])
     rows.append([('К расписанию','schedule')])
     await m.answer(text,reply_markup=kb(rows))
@@ -305,17 +310,17 @@ async def dispatch(m,uid,k,state):
     if k=='book':return await select_masters(m,state)
     if k=='my':return await listing(m,uid,'client','all')
     if k in ('staff','manager'):
-        if k=='manager' and uid!=MANAGER:return
+        if k=='manager' and uid not in MANAGERS:return
         if k=='staff' and not await master(uid):return
         await state.clear()
         rows=([[('Выдать права мастера','grant')],[('Ручная запись','manual_all')]] if k=='manager' else [[('Профиль','profile'),('Услуги','services')],[('Расписание','schedule')],[('Ручная запись','manual_self')]])
         rows += [[('Сегодня',f'list:{k}:today'),('Завтра',f'list:{k}:tomorrow')],[('7 дней',f'list:{k}:week'),('30 дней',f'list:{k}:month')],[('Все предстоящие',f'list:{k}:all')],[('В меню','home')]]
         return await m.answer('Управление салоном' if k=='manager' else 'Кабинет мастера',reply_markup=kb(rows))
     if k=='grant':
-        if uid==MANAGER:await prompt(m,state,'grant','Введите числовой Telegram ID мастера. Мастер узнает его командой /id.')
+        if uid in MANAGERS:await prompt(m,state,'grant','Введите числовой Telegram ID мастера. Мастер узнает его командой /id.')
         return
     if k=='manual_all':
-        if uid==MANAGER:await select_masters(m,state,True)
+        if uid in MANAGERS:await select_masters(m,state,True)
         return
     if k=='manual_self':
         if not await master(uid):return
@@ -326,7 +331,7 @@ async def dispatch(m,uid,k,state):
         return await listing(m,uid,scope,period)
     if k.startswith('master:'):
         mid=int(k.split(':')[1])
-        if d.get('manual') and uid not in (mid,MANAGER):return
+        if d.get('manual') and uid not in MANAGERS and uid!=mid:return
         return await select_services(m,state,mid)
     if k.startswith('service:'):
         sid=int(k.split(':')[1]);s=await sql('SELECT * FROM services WHERE id=? AND active=1',(sid,),True)
@@ -354,9 +359,9 @@ async def dispatch(m,uid,k,state):
         return
     if k.startswith(('move:','cancel:','cancelok:','yes:','status:')):
         p=k.split(':');action=p[0];bid=int(p[1]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
-        if not b or uid not in (b['client'],b['master'],MANAGER):raise ValueError('Запись недоступна.')
+        if not b or uid not in MANAGERS and uid not in (b['client'],b['master']):raise ValueError('Запись недоступна.')
         if action=='status':
-            if uid not in (b['master'],MANAGER):return
+            if uid not in MANAGERS and uid!=b['master']:return
             value=p[2]
             if value not in ('expected','arrived','missed'):return
             changed=await sql("UPDATE bookings SET visit_state=? WHERE id=? AND status='active' AND start<=? RETURNING id",(value,bid,ts()))
@@ -446,7 +451,7 @@ async def input_text(m:Message,state:FSMContext):
     d=await state.get_data();action=d.get('action');uid=m.from_user.id;text=(m.text or '').strip()
     try:
         if action=='grant':
-            if uid!=MANAGER:return
+            if uid not in MANAGERS:return
             if not text.isdecimal() or int(text)<=0:raise ValueError('Введите числовой Telegram ID.')
             await sql('INSERT OR IGNORE INTO masters(id) VALUES(?)',(int(text),));await send(int(text),'Вам выданы права мастера. Откройте /start → Кабинет мастера.');await state.clear();return await m.answer('Права выданы.')
         if action in ('profile','service','schedule_date','block_date','clock') and not await master(uid):return
@@ -560,11 +565,11 @@ async def ready(mid):
 async def home(m,uid,state):
     await state.clear()
     p=await master(uid)
-    title='CRM Салона' if p or uid==MANAGER else 'Запись к мастеру'
+    title='CRM Салона' if p or uid in MANAGERS else 'Запись к мастеру'
     await m.answer(title,reply_markup=NAV)
     rows=[[('Записаться','book'),('Мои записи','my')]]
     if p:rows.append([('Кабинет мастера','staff')])
-    if uid==MANAGER:rows.append([('Управление салоном','manager')])
+    if uid in MANAGERS:rows.append([('Управление салоном','manager')])
     await m.answer('Выберите действие:',reply_markup=kb(rows))
 
 async def select_masters(m,state,manual=False):
@@ -596,7 +601,7 @@ def staff_buttons(b):
 
 async def access_booking(uid,b,staff=False):
     if not b:return False
-    if uid==MANAGER:return True
+    if uid in MANAGERS:return True
     if uid==b['master'] and await master(uid):return True
     return not staff and uid==b['client']
 
@@ -607,7 +612,7 @@ async def card(m,uid,bid):
     await m.answer('Мастер: '+b['master_name']+'\n'+details(b),reply_markup=markup)
 
 async def cabinet(m,uid,state,kind):
-    if kind=='manager' and uid!=MANAGER:return
+    if kind=='manager' and uid not in MANAGERS:return
     if kind=='staff' and not await master(uid):return
     await state.clear()
     if kind=='manager':
@@ -636,11 +641,11 @@ async def master_card(m,mid):
     await m.answer(text,reply_markup=kb(rows))
 
 async def history(m,uid,state,scope,page=0):
-    if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+    if uid not in MANAGERS and not await master(uid):raise ValueError('Нет доступа.')
     filters=[];args=[]
-    if uid!=MANAGER:filters.append('b.master=?');args.append(uid)
+    if uid not in MANAGERS:filters.append('b.master=?');args.append(uid)
     if scope.startswith('master-'):
-        if uid!=MANAGER:raise ValueError('Нет доступа.')
+        if uid not in MANAGERS:raise ValueError('Нет доступа.')
         filters.append('b.master=?');args.append(int(scope[7:]))
     elif scope=='search':
         d=await state.get_data();term=d.get('search','')
@@ -657,7 +662,7 @@ async def history(m,uid,state,scope,page=0):
     buttons=[]
     if page:buttons.append(('←',f'v3:history:{scope}:{page-1}'))
     if (page+1)*8<count['n']:buttons.append(('→',f'v3:history:{scope}:{page+1}'))
-    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid==MANAGER else 'staff')]]))
+    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid in MANAGERS else 'staff')]]))
 
 async def availability(s,day,move=0):
     async with aiosqlite.connect(DB) as c:ws=await intervals(c,s['master'],day)
@@ -717,7 +722,7 @@ async def back(m,uid,state):
     if a=='date' and d.get('mid') and not d.get('move'):return await select_services(m,state,d['mid'])
     if a=='clock' and d.get('which')=='end':return await clock(m,state,'start')
     if a in ('clock','step','target','block_confirm','schedule_date','block_date') and await master(uid):return await schedule_menu(m,state,uid)
-    if uid==MANAGER:return await cabinet(m,uid,state,'manager')
+    if uid in MANAGERS:return await cabinet(m,uid,state,'manager')
     if await master(uid):return await cabinet(m,uid,state,'staff')
     return await home(m,uid,state)
 
@@ -787,6 +792,73 @@ async def target_menu(m,state,uid,target):
 async def clock(m,state,which):
     await _clock2(m,state,which)
 
+WEEKDAY_NAMES = ('Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье')
+
+
+async def copy_week_schedule(m, uid, key, state):
+    if not await master(uid):
+        raise ValueError('Нет прав мастера.')
+    parts = key.split(':')
+    if parts[1] == 'copyconfirm':
+        data = await state.get_data()
+        pending = data.get('week_copy') or {}
+        if pending.get('nonce') != parts[2]:
+            raise ValueError('Подтверждение устарело.')
+        source, destination = pending['source'], pending['destination']
+        async with aiosqlite.connect(DB, timeout=30) as c:
+            await c.execute('BEGIN IMMEDIATE')
+            enabled = await (await c.execute('SELECT enabled FROM masters WHERE id=?', (uid,))).fetchone()
+            if not enabled or not enabled[0]:
+                raise ValueError('Нет прав мастера.')
+            for target, expected in ((source, pending['intervals']), (destination, pending['previous'])):
+                row = await (await c.execute(
+                    'SELECT intervals FROM v2_schedule WHERE master=? AND target=?', (uid, target)
+                )).fetchone()
+                if (row[0] if row else None) != expected:
+                    raise ValueError('График изменился. Начните копирование заново.')
+            await c.execute(
+                'INSERT OR REPLACE INTO v2_schedule(master,target,intervals) VALUES(?,?,?)',
+                (uid, destination, pending['intervals']),
+            )
+            await c.commit()
+        await m.answer('График скопирован.')
+        await target_menu(m, state, uid, destination)
+        return await conflicts(m, uid)
+
+    source_day = int(parts[2])
+    if source_day not in range(7):
+        raise ValueError('Выберите день недели.')
+    source = f'w:{source_day}'
+    row = await sql('SELECT intervals FROM v2_schedule WHERE master=? AND target=?', (uid, source), True)
+    if not row or not unpack(row['intervals']):
+        raise ValueError('В исходном дне нет рабочих интервалов.')
+    if len(parts) == 3:
+        await state.set_state(None)
+        await state.set_data(dict(action='target', target=source))
+        rows = [[(name, f'v3:copyweek:{source_day}:{day}')]
+                for day, name in enumerate(WEEKDAY_NAMES) if day != source_day]
+        rows.append([('К расписанию', 'schedule')])
+        return await m.answer('На какой день скопировать график?', reply_markup=kb(rows))
+
+    destination_day = int(parts[3])
+    if destination_day not in range(7) or destination_day == source_day:
+        raise ValueError('Выберите другой день недели.')
+    destination = f'w:{destination_day}'
+    previous = await sql('SELECT intervals FROM v2_schedule WHERE master=? AND target=?', (uid, destination), True)
+    nonce = secrets.token_hex(6)
+    await state.set_state(None)
+    await state.set_data(dict(week_copy=dict(
+        nonce=nonce, source=source, destination=destination,
+        intervals=row['intervals'], previous=previous['intervals'] if previous else None,
+    )))
+    await m.answer(
+        f'Скопировать график с дня «{WEEKDAY_NAMES[source_day]}» на день «{WEEKDAY_NAMES[destination_day]}»?\n'
+        'График выбранного дня будет заменён. Существующие записи сохранятся.',
+        reply_markup=kb([[('Подтвердить', f'v3:copyconfirm:{nonce}')],
+                         [('Отмена', f'v3:copyweek:{source_day}')]]),
+    )
+
+
 async def danger(m,uid,k,state):
     d=await state.get_data()
     if not await master(uid):raise ValueError('Нет прав мастера.')
@@ -831,17 +903,17 @@ async def dispatch(m,uid,k,state):
         if await master(uid):return await readiness(m,uid)
         return
     if k=='v3:masters':
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         await state.clear()
         rows=await sql('SELECT * FROM masters ORDER BY enabled DESC,name')
         if not rows:await m.answer('Мастеров пока нет.')
         for i in range(0,len(rows),25):await m.answer('Мастера:',reply_markup=kb([[((p['name'] or str(p['id']))+(' · отключён' if not p['enabled'] else ''),f"v3:master:{p['id']}")] for p in rows[i:i+25]]))
         return await m.answer('Действия:',reply_markup=kb([[('Выдать права','grant'),('В кабинет','manager')]]))
     if k.startswith('v3:master:'):
-        if uid==MANAGER:return await master_card(m,int(k.split(':')[2]))
+        if uid in MANAGERS:return await master_card(m,int(k.split(':')[2]))
         return
     if k.startswith('v3:right:'):
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         _,_,mid,value=k.split(':');mid=int(mid);value=int(value)
         if value not in (0,1):return
         p=await sql('SELECT * FROM masters WHERE id=?',(mid,),True)
@@ -851,18 +923,18 @@ async def dispatch(m,uid,k,state):
         d=await state.get_data()
         return await m.answer(('Восстановить' if value else 'Отозвать')+f" права мастера {p['name'] or mid}?\nПредстоящих записей: {count['n']}. Они останутся у управляющего. Профиль, услуги и история сохранятся. Клиентские функции останутся доступны.",reply_markup=kb([[('Подтвердить','v3:rightok:'+d['nonce'])],[('Назад',f'v3:master:{mid}')]]))
     if k.startswith('v3:rightok:'):
-        if uid!=MANAGER or d.get('action')!='rights' or k.split(':')[2]!=d.get('nonce'):raise ValueError('Подтверждение устарело.')
+        if uid not in MANAGERS or d.get('action')!='rights' or k.split(':')[2]!=d.get('nonce'):raise ValueError('Подтверждение устарело.')
         await sql('UPDATE masters SET enabled=? WHERE id=? AND enabled=?',(d['value'],d['mid'],d['old']))
         target_context=dp.fsm.get_context(bot=bot,chat_id=d['mid'],user_id=d['mid'])
         await target_context.clear();await state.clear()
         await send(d['mid'],'Права мастера '+('восстановлены.' if d['value'] else 'отозваны. Клиентские функции сохранены.')+' Откройте главное меню.')
         return await master_card(m,d['mid'])
     if k.startswith('v3:manual:'):
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         mid=int(k.split(':')[2]);await state.clear();await state.update_data(manual=True)
         return await select_services(m,state,mid)
     if k.startswith('v3:masterschedule:'):
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         mid=int(k.split(':')[2]);lines=['Расписание мастера (просмотр), МСК:']
         for r in await sql('SELECT * FROM v2_schedule WHERE master=? ORDER BY target',(mid,)):
             label=['Пн','Вт','Ср','Чт','Пт','Сб','Вс'][int(r['target'][2:])] if r['target'].startswith('w:') else r['target'][2:]
@@ -872,12 +944,12 @@ async def dispatch(m,uid,k,state):
         for i in range(0,len(text),3500):await m.answer(text[i:i+3500])
         return await m.answer('Карточка мастера:',reply_markup=kb([[('Назад',f'v3:master:{mid}')]]))
     if k.startswith('v3:masterbook:'):
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         p=k.split(':');return await history(m,uid,state,'master-'+p[2],int(p[3]))
     if k.startswith('v3:history:'):
         p=k.split(':');return await history(m,uid,state,p[2],int(p[3]))
     if k=='v3:search':
-        if uid!=MANAGER and not await master(uid):return
+        if uid not in MANAGERS and not await master(uid):return
         return await prompt(m,state,'search','Введите имя (регистр букв учитывается для кириллицы) или часть телефона:')
     if k.startswith(('v3:contacts:','v3:repeat:')):
         p=k.split(':');bid=int(p[2]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
@@ -912,6 +984,8 @@ async def dispatch(m,uid,k,state):
         if d.get('wizard') and d.get('stage') in ('bio','price'):return await wizard_value(m,uid,state,'-')
         return
     if k=='v3:wizard_save':return await wizard_save(m,uid,state)
+    if k.startswith(('v3:copyweek:', 'v3:copyconfirm:')):
+        return await copy_week_schedule(m, uid, k, state)
     if k.startswith('v3:danger:'):
         pending=d.get('danger') or {}
         if pending.get('nonce')!=k.split(':')[2]:raise ValueError('Подтверждение устарело.')
@@ -948,12 +1022,12 @@ async def input_v3(m:Message,state:FSMContext):
             if m.contact:text=m.contact.phone_number
             return await wizard_value(m,uid,state,text)
         if d.get('action')=='search':
-            if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+            if uid not in MANAGERS and not await master(uid):raise ValueError('Нет доступа.')
             if not 2<=len(text)<=100:raise ValueError('Введите от 2 до 100 символов.')
             await state.set_state(None);await state.update_data(search=text)
             return await history(m,uid,state,'search',0)
         if d.get('action')=='grant':
-            if uid!=MANAGER:return
+            if uid not in MANAGERS:return
             if not text.isdecimal() or int(text)<=0:raise ValueError('Нужен числовой Telegram ID.')
             target=int(text)
             await sql('INSERT OR IGNORE INTO masters(id) VALUES(?)',(target,))
@@ -974,10 +1048,8 @@ async def fallback_v3(m:Message,state:FSMContext):
 import hashlib
 import time as monotime
 from collections import deque
-from contextvars import ContextVar
 from aiogram import BaseMiddleware
 
-ACTOR=ContextVar('actor',default=0)
 _initialize3=initialize
 _dispatch3=dispatch
 _home3=home
@@ -1012,37 +1084,42 @@ async def sql(q,args=(),one=False):
         await c.create_function('casefold',1,folded)
         await c.create_function('digits',1,phone_norm)
         cur=await c.execute(q,args);rows=await cur.fetchall()
-        verb=q.lstrip().split(None,1)[0].upper()
-        # Metadata only: never store SQL arguments, tokens, names or telephone numbers.
-        if verb in ('UPDATE','INSERT','DELETE') and re.search(r'\b(bookings|masters|services|v2_schedule|v2_blocks)\b',q,re.I):
-            table=re.search(r'\b(bookings|masters|services|v2_schedule|v2_blocks)\b',q,re.I).group(1)
-            if cur.rowcount!=0:
-                await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),ACTOR.get(),verb+' '+table,0))
         await c.commit()
         return (dict(rows[0]) if rows else None) if one else [dict(r) for r in rows]
-
-async def audit(event,object_id=0,actor=None):
-    await sql('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),ACTOR.get() if actor is None else actor,event,object_id))
 
 async def initialize():
     await _initialize3()
     async with aiosqlite.connect(DB,timeout=30) as c:
         await c.executescript("""
-        CREATE TABLE IF NOT EXISTS v4_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,at INTEGER NOT NULL,actor INTEGER NOT NULL,event TEXT NOT NULL,object_id INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS v4_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS v4_contacts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS v4_invites(hash TEXT PRIMARY KEY,booking INTEGER NOT NULL,expires INTEGER NOT NULL,issuer INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS v4_claims(id INTEGER PRIMARY KEY AUTOINCREMENT,hash TEXT NOT NULL,requester INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',UNIQUE(hash,requester));
-        CREATE TABLE IF NOT EXISTS v4_delete_requests(id INTEGER PRIMARY KEY AUTOINCREMENT,uid INTEGER NOT NULL,created INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending');
         CREATE TABLE IF NOT EXISTS v4_delivery(booking INTEGER NOT NULL,start INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,alerted INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(booking,start));
-        CREATE INDEX IF NOT EXISTS v4_audit_time ON v4_audit(at);
         """)
+        await c.execute('BEGIN IMMEDIATE')
+        selected = await (await c.execute("SELECT 1 FROM v4_settings WHERE key='active_contact_id'")).fetchone()
+        if not selected:
+            legacy = await (await c.execute("SELECT value FROM v4_settings WHERE key='admin_contact'")).fetchone()
+            contact = legacy[0] if legacy else os.getenv('ADMIN_CONTACT', '').strip()
+            contact_id = ''
+            if contact:
+                cursor = await c.execute('INSERT INTO v4_contacts(contact) VALUES(?)', (contact,))
+                contact_id = str(cursor.lastrowid)
+            await c.execute("INSERT INTO v4_settings(key,value) VALUES('active_contact_id',?)", (contact_id,))
         await c.commit()
     if not await setting('salon_name') or not await setting('admin_contact'):
         logging.warning('Salon name/contact not configured. Use manager settings.')
 
 async def setting(key):
+    if key == 'admin_contact':
+        row = await sql("SELECT contact FROM v4_contacts WHERE id=(SELECT value FROM v4_settings WHERE key='active_contact_id')", one=True)
+        return row['contact'] if row else ''
     r=await sql('SELECT value FROM v4_settings WHERE key=?',(key,),True)
-    env={'salon_name':'SALON_NAME','admin_contact':'ADMIN_CONTACT'}
+    env={'salon_name':'SALON_NAME'}
     return r['value'] if r else os.getenv(env.get(key,''),'').strip()
 
 class Guard(BaseMiddleware):
@@ -1065,7 +1142,6 @@ class Guard(BaseMiddleware):
             if isinstance(event,CallbackQuery):await event.answer('Слишком часто. Подождите несколько секунд.')
             return
         queue.append(current)
-        token=ACTOR.set(user.id)
         try:return await handler(event,data)
         except Exception as e:
             logging.error('Handler failed: %s',type(e).__name__)
@@ -1073,7 +1149,6 @@ class Guard(BaseMiddleware):
                 with contextlib.suppress(Exception):await message.answer('Не удалось завершить действие. Проверьте запись в меню перед повтором.',reply_markup=NAV)
             # No exception text: Telegram errors can contain personal data or URLs.
             with contextlib.suppress(Exception):await _send3(MANAGER,'Ошибка обработки действия: '+type(e).__name__+'. Проверьте логи приложения.')
-        finally:ACTOR.reset(token)
 
 guard=Guard()
 dp.message.outer_middleware(guard)
@@ -1082,7 +1157,7 @@ dp.callback_query.outer_middleware(guard)
 async def send_staff(mid,text,markup=None):
     # Recheck immediately before each attempt, not just when generating a notification.
     for attempt in range(3):
-        if mid!=MANAGER and not await master(mid):return 'skip'
+        if mid not in MANAGERS and not await master(mid):return 'skip'
         try:
             await bot.send_message(mid,text,reply_markup=markup);return 'ok'
         except TelegramRetryAfter as e:await asyncio.sleep(min(e.retry_after,60))
@@ -1101,8 +1176,8 @@ async def home(m,uid,state):
 
 async def cabinet(m,uid,state,kind):
     await _cabinet3(m,uid,state,kind)
-    if kind=='manager' and uid==MANAGER:
-        await m.answer('Администрирование:',reply_markup=kb([[('Настройки салона','v4:settings')],[('Журнал действий','v4:audit:0')],[('Привязки клиентов','v4:claims'),('Запросы удаления','v4:deletions')]]))
+    if kind=='manager' and uid in MANAGERS:
+        await m.answer('Администрирование:',reply_markup=kb([[('Настройки салона','v4:settings')],[('Привязки клиентов','v4:claims')]]))
     elif kind=='staff' and await master(uid):
         await m.answer('Ручные записи:',reply_markup=kb([[('Запросы привязки','v4:claims')]]))
 
@@ -1113,11 +1188,11 @@ def staff_buttons(b):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def history(m,uid,state,scope,page=0):
-    if uid!=MANAGER and not await master(uid):raise ValueError('Нет доступа.')
+    if uid not in MANAGERS and not await master(uid):raise ValueError('Нет доступа.')
     filters=[];args=[]
-    if uid!=MANAGER:filters.append('b.master=?');args.append(uid)
+    if uid not in MANAGERS:filters.append('b.master=?');args.append(uid)
     if scope.startswith('master-'):
-        if uid!=MANAGER:raise ValueError('Нет доступа.')
+        if uid not in MANAGERS:raise ValueError('Нет доступа.')
         filters.append('b.master=?');args.append(int(scope[7:]))
     elif scope=='search':
         term=(await state.get_data()).get('search','')
@@ -1138,7 +1213,7 @@ async def history(m,uid,state,scope,page=0):
     buttons=[]
     if page:buttons.append(('←',f'v3:history:{scope}:{page-1}'))
     if (page+1)*8<count['n']:buttons.append(('→',f'v3:history:{scope}:{page+1}'))
-    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid==MANAGER else 'staff')]]))
+    await m.answer('Навигация:',reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager' if uid in MANAGERS else 'staff')]]))
 
 async def invite(m,uid,bid):
     b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
@@ -1151,7 +1226,6 @@ async def invite(m,uid,bid):
         await c.execute('INSERT INTO v4_invites(hash,booking,expires,issuer) VALUES(?,?,?,?)',(digest,bid,ts()+LINK_HOURS*3600,uid))
         await c.commit()
     me=await bot.get_me()
-    await audit('invite_created',bid)
     await m.answer(f'Отправьте эту ссылку лично клиенту. Она действует {LINK_HOURS} ч. Предыдущая ссылка аннулирована.\nПосле перехода потребуется подтверждение сотрудником салона. Не размещайте ссылку публично.\nhttps://t.me/{me.username}?start=bind_{token}')
 
 async def link_start(m,state,token):
@@ -1175,16 +1249,15 @@ async def create_claim(m,uid,state,k):
         r=await (await c.execute('SELECT id FROM v4_claims WHERE hash=? AND requester=?',(d['hash'],uid))).fetchone()
         await c.commit()
     await state.clear();await m.answer('Запрос отправлен. Сотрудник должен проверить, что запись принадлежит вам. При необходимости свяжитесь с администратором.')
-    await audit('link_requested',i['booking'])
     markup=kb([[('Проверить запрос',f"v4:claim:{r['id']}")]])
-    for target in {MANAGER,i['master']}:
+    for target in MANAGERS | {i['master']}:
         await send_staff(target,f"Запрос привязки к записи №{i['booking']}. Telegram ID заявителя: {uid}. Проверьте личность через известный контакт клиента, а не только по имени профиля.",markup)
 
 async def claims(m,uid):
-    if uid!=MANAGER and not await master(uid):raise ValueError('Нет прав.')
+    if uid not in MANAGERS and not await master(uid):raise ValueError('Нет прав.')
     q="SELECT c.id,i.booking FROM v4_claims c JOIN v4_invites i ON i.hash=c.hash JOIN bookings b ON b.id=i.booking WHERE c.status='pending' AND i.used=0 AND i.expires>?"
     args=[ts()]
-    if uid!=MANAGER:q+=' AND b.master=?';args.append(uid)
+    if uid not in MANAGERS:q+=' AND b.master=?';args.append(uid)
     rows=await sql(q+' ORDER BY c.id DESC LIMIT 50',args)
     if not rows:return await m.answer('Нет ожидающих запросов.')
     for r in rows:await m.answer(f"Запрос №{r['id']} · запись №{r['booking']}",reply_markup=kb([[('Проверить',f"v4:claim:{r['id']}")]]))
@@ -1206,14 +1279,13 @@ async def decide_claim(m,uid,state,approve,nonce):
         r=await (await c.execute('SELECT c.*,i.booking,i.expires,i.used FROM v4_claims c JOIN v4_invites i ON i.hash=c.hash WHERE c.id=?',(d['cid'],))).fetchone()
         b=await (await c.execute('SELECT * FROM bookings WHERE id=?',(r['booking'],))).fetchone() if r else None
         active=await (await c.execute('SELECT id FROM masters WHERE id=? AND enabled=1',(uid,))).fetchone()
-        if not b or (uid!=MANAGER and (uid!=b['master'] or not active)):raise ValueError('Нет доступа.')
+        if not b or (uid not in MANAGERS and (uid!=b['master'] or not active)):raise ValueError('Нет доступа.')
         if r['status']!='pending' or r['used'] or r['expires']<=ts() or b['client'] is not None or b['status']!='active' or b['start']<=ts():raise ValueError('Запрос устарел.')
         if approve:
             await c.execute('UPDATE bookings SET client=?,reminder=? WHERE id=?',(r['requester'],int(b['start']-ts()<86400),b['id']))
             await c.execute('UPDATE v4_invites SET used=1 WHERE booking=?',(b['id'],))
             await c.execute("UPDATE v4_claims SET status='superseded' WHERE hash=? AND status='pending'",(r['hash'],))
         await c.execute('UPDATE v4_claims SET status=? WHERE id=?',('approved' if approve else 'rejected',r['id']))
-        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'link_approved' if approve else 'link_rejected',b['id']))
         await c.commit()
     await state.clear();await m.answer('Привязка подтверждена.' if approve else 'Запрос отклонён.')
     if approve:
@@ -1221,58 +1293,87 @@ async def decide_claim(m,uid,state,approve,nonce):
         await _send3(r['requester'],'Запись привязана к вашему аккаунту.\n'+details(current),client_buttons(current))
     else:await _send3(r['requester'],'Запрос привязки отклонён. Свяжитесь с салоном.')
 
-async def deletion_menu(m,uid):
-    if uid!=MANAGER:raise ValueError('Нет доступа.')
-    rows=await sql("SELECT * FROM v4_delete_requests WHERE status='pending' ORDER BY id LIMIT 50")
-    if not rows:return await m.answer('Нет запросов удаления.')
-    for r in rows:await m.answer(f"Запрос №{r['id']} · Telegram ID {r['uid']} · {fmt(r['created'])}",reply_markup=kb([[('Рассмотреть',f"v4:deletion:{r['id']}")]]))
+async def contact_menu(m, page=0):
+    page = max(0, page)
+    contacts = await sql(
+        "SELECT id, contact, id=(SELECT value FROM v4_settings WHERE key='active_contact_id') AS active "
+        "FROM v4_contacts ORDER BY id LIMIT 9 OFFSET ?", (page * 8,)
+    )
+    if page and not contacts:
+        return await contact_menu(m)
+    rows = []
+    for contact in contacts[:8]:
+        label = '✓ ' if contact['active'] else ''
+        label += ' '.join(contact['contact'].split())[:48]
+        rows.append([(label, f"v4:contact:open:{contact['id']}")])
+    navigation = []
+    if page:
+        navigation.append(('←', f'v4:contact:list:{page-1}'))
+    if len(contacts) > 8:
+        navigation.append(('→', f'v4:contact:list:{page+1}'))
+    if navigation:
+        rows.append(navigation)
+    rows.extend([[('Добавить контакт', 'v4:contact:add')], [('Назад', 'v4:settings')]])
+    active = await setting('admin_contact')
+    await m.answer('Сейчас отображается: ' + (active or 'контакт не выбран'), reply_markup=kb(rows))
 
-async def prepare_erasure(m,uid,state,request_id=None,bid=None):
-    if uid!=MANAGER:raise ValueError('Обезличивание подтверждает только управляющий.')
-    subject=None
-    if request_id:
-        r=await sql("SELECT * FROM v4_delete_requests WHERE id=? AND status='pending'",(request_id,),True)
-        if not r:raise ValueError('Запрос уже обработан.')
-        subject=r['uid'];where='client=?';args=[subject]
-    else:where='id=?';args=[bid]
-    count=await sql('SELECT COUNT(*) n FROM bookings WHERE '+where,args,True)
-    active=await sql("SELECT COUNT(*) n FROM bookings WHERE "+where+" AND status='active' AND end>?",args+[ts()],True)
-    nonce=secrets.token_hex(6)
-    await state.set_state(None);await state.set_data(dict(action='erase_confirm',request_id=request_id,bid=bid,subject=subject,nonce=nonce))
-    text=f"Записей найдено: {count['n']}. Действующих: {active['n']}.\nОбезличивание заменит имя и телефон в завершённых/отменённых записях и удалит связь с Telegram. Действующие записи НЕ изменяются.\nЭто не полное удаление из всех систем: профиль мастера, аудит, резервные копии и сообщения Telegram требуют отдельной проверки. Проверьте законные основания и сроки хранения перед подтверждением."
-    await m.answer(text,reply_markup=kb([[('Подтвердить обезличивание','v4:eraseok:'+nonce)],[('Отмена','home')]]))
 
-async def erase_confirm(m,uid,state,nonce):
-    d=await state.get_data()
-    if uid!=MANAGER or d.get('action')!='erase_confirm' or d.get('nonce')!=nonce:raise ValueError('Нет доступа или форма устарела.')
-    where='client=?' if d.get('subject') else 'id=?';args=[d['subject'] if d.get('subject') else d['bid']]
-    async with aiosqlite.connect(DB,timeout=30) as c:
-        await c.execute('BEGIN IMMEDIATE')
-        ids=[r[0] for r in await (await c.execute("SELECT id FROM bookings WHERE "+where+" AND (status<>'active' OR end<=?)",args+[ts()])).fetchall()]
-        for bid in ids:
-            await c.execute("UPDATE bookings SET name='[Удалено]',phone='',client=NULL WHERE id=?",(bid,))
-            await c.execute('DELETE FROM v4_claims WHERE hash IN (SELECT hash FROM v4_invites WHERE booking=?)',(bid,))
-            await c.execute('DELETE FROM v4_invites WHERE booking=?',(bid,))
-        if d.get('request_id'):
-            await c.execute("UPDATE v4_delete_requests SET status='review_required' WHERE id=?",(d['request_id'],))
-        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'anonymize_completed_bookings',d.get('bid') or 0))
-        await c.commit()
-    await state.clear();await m.answer(f'Обезличено записей: {len(ids)}. Действующие записи сохранены. Запрос не считается полностью исполненным: проверьте остальные места хранения и уведомите клиента.')
-    if d.get('subject'):await _send3(d['subject'],'Салон обработал завершённые/отменённые записи в рамках запроса удаления. Действующие записи и иные места хранения требуют отдельного рассмотрения. Для итогового ответа обратитесь к администратору.')
+async def manage_contact(m, state, key):
+    action, _, value = key.removeprefix('v4:contact:').partition(':')
+    if action == 'add':
+        return await prompt(m, state, 'v4_contact_add', 'Введите контакт администратора (до 300 символов).')
+    await state.clear()
+    if action == 'list':
+        return await contact_menu(m, int(value))
+
+    contact_id = int(value)
+    contact = await sql('SELECT contact FROM v4_contacts WHERE id=?', (contact_id,), True)
+    if not contact:
+        await m.answer('Контакт уже удалён.')
+        return await contact_menu(m)
+    if action == 'open':
+        return await m.answer(contact['contact'], reply_markup=kb([
+            [('Показывать клиентам', f'v4:contact:select:{contact_id}')],
+            [('Удалить контакт', f'v4:contact:delete:{contact_id}')],
+            [('К списку', 'v4:contact:list:0')],
+        ]))
+    if action == 'delete':
+        return await m.answer('Удалить контакт?\n' + contact['contact'], reply_markup=kb([
+            [('Да, удалить', f'v4:contact:confirm:{contact_id}')],
+            [('Отмена', f'v4:contact:open:{contact_id}')],
+        ]))
+    if action == 'select':
+        await sql(
+            "UPDATE v4_settings SET value=? WHERE key='active_contact_id' "
+            "AND EXISTS(SELECT 1 FROM v4_contacts WHERE id=?)",
+            (str(contact_id), contact_id),
+        )
+    if action == 'confirm':
+        async with aiosqlite.connect(DB, timeout=30) as c:
+            await c.execute('BEGIN IMMEDIATE')
+            await c.execute('DELETE FROM v4_contacts WHERE id=?', (contact_id,))
+            await c.execute("UPDATE v4_settings SET value='' WHERE key='active_contact_id' AND value=?", (str(contact_id),))
+            await c.commit()
+    await contact_menu(m)
+
 
 async def dispatch(m,uid,k,state):
     d=await state.get_data()
     if k=='v3:search':
-        if uid!=MANAGER and not await master(uid):return
+        if uid not in MANAGERS and not await master(uid):return
         return await prompt(m,state,'search','Введите имя или часть телефона (без учёта регистра, скобок, пробелов и дефисов):')
     if k=='v4:settings':
-        if uid!=MANAGER:return
+        if uid not in MANAGERS:return
         return await m.answer('Настройки салона:',reply_markup=kb([[('Название','v4:setting:salon_name')],[('Контакт администратора','v4:setting:admin_contact')],[('Управление','manager')]]))
-    if k.startswith('v4:setting:'):
-        if uid!=MANAGER:return
-        key=k.split(':')[2]
-        if key not in ('salon_name','admin_contact'):return
-        return await prompt(m,state,'v4_setting','Введите '+('название салона (до 100 символов):' if key=='salon_name' else 'контакт администратора (до 300 символов):'),setting_key=key)
+    if k=='v4:setting:admin_contact' or k.startswith('v4:contact:'):
+        if uid not in MANAGERS:return
+        if k=='v4:setting:admin_contact':
+            await state.clear()
+            return await contact_menu(m)
+        return await manage_contact(m,state,k)
+    if k=='v4:setting:salon_name':
+        if uid not in MANAGERS:return
+        return await prompt(m,state,'v4_setting','Введите название салона (до 100 символов):')
     if k.startswith('v4:invite:'):return await invite(m,uid,int(k.split(':')[2]))
     if k.startswith('v4:linkconfirm:'):return await create_claim(m,uid,state,k)
     if k=='v4:claims':return await claims(m,uid)
@@ -1282,40 +1383,15 @@ async def dispatch(m,uid,k,state):
         return await m.answer('Выгрузка данных отключена.')
     if k=='v4:delete_request' or k.startswith('v4:deleteask:'):
         return await m.answer('Подача запросов через бота отключена.')
-    if k=='v4:deletions':return await deletion_menu(m,uid)
-    if k.startswith('v4:deletion:'):return await prepare_erasure(m,uid,state,request_id=int(k.split(':')[2]))
-    if k.startswith('v4:erasebooking:'):
-        bid=int(k.split(':')[2]);b=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
-        if not await access_booking(uid,b,True):raise ValueError('Нет доступа.')
-        if uid!=MANAGER:
-            return await m.answer('Подача запросов через бота отключена.')
-        return await prepare_erasure(m,uid,state,bid=bid)
-    if k.startswith('v4:eraseok:'):return await erase_confirm(m,uid,state,k.split(':')[2])
-    if k.startswith('v4:audit:'):
-        if uid!=MANAGER:return
-        page=max(0,int(k.split(':')[2]));rows=await sql('SELECT * FROM v4_audit ORDER BY id DESC LIMIT 16 OFFSET ?',(page*15,))
-        text='Журнал действий (ID пользователя / действие / объект):\n'+'\n'.join(f"{fmt(r['at'])} · {r['actor']} · {r['event']} · {r['object_id']}" for r in rows[:15])
-        buttons=[]
-        if page:buttons.append(('←',f'v4:audit:{page-1}'))
-        if len(rows)>15:buttons.append(('→',f'v4:audit:{page+1}'))
-        return await m.answer(text[:3900],reply_markup=kb(([buttons] if buttons else [])+[[('В кабинет','manager')]]))
-    # Capture events only after the original operation has actually changed the database.
-    before=None;bid=None
-    if k.startswith(('cancelok:','status:')):
-        bid=int(k.split(':')[1]);before=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
-    if k=='v3:wizard_save' and d.get('wizard')=='contacts':
-        bid=d.get('bid');before=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
+    if k=='v4:deletions' or k.startswith(('v4:deletion:', 'v4:erasebooking:', 'v4:eraseok:', 'v4:audit:')):
+        return await m.answer('Эта функция отключена.')
     rights_before=None
     if k.startswith('v3:rightok:') and d.get('mid'):
         rights_before=await sql('SELECT enabled FROM masters WHERE id=?',(d['mid'],),True)
     result=await _dispatch3(m,uid,k,state)
-    if before:
-        after=await sql('SELECT * FROM bookings WHERE id=?',(bid,),True)
-        if after and any(before.get(x)!=after.get(x) for x in ('status','visit_state','name','phone')):await audit('booking_changed',bid)
     if rights_before:
         after=await sql('SELECT enabled FROM masters WHERE id=?',(d['mid'],),True)
         if after and after!=rights_before:
-            await audit('rights_restored' if after['enabled'] else 'rights_revoked',d['mid'])
             if not after['enabled']:
                 await sql('UPDATE v4_invites SET used=1 WHERE issuer=?',(d['mid'],))
     return result
@@ -1329,12 +1405,19 @@ async def start_v4(m:Message,state:FSMContext):
 
 async def input_v4(m:Message,state:FSMContext):
     d=await state.get_data();uid=m.from_user.id
+    if d.get('action')=='v4_contact_add':
+        if uid not in MANAGERS:return
+        text=(m.text or '').strip()
+        if not 1<=len(text)<=300:return await m.answer('Введите текст от 1 до 300 символов.')
+        await sql('INSERT INTO v4_contacts(contact) VALUES(?)',(text,))
+        await state.clear()
+        return await contact_menu(m)
     if d.get('action')=='v4_setting':
-        if uid!=MANAGER:return
-        text=(m.text or '').strip();limit=100 if d['setting_key']=='salon_name' else 300
+        if uid not in MANAGERS:return
+        text=(m.text or '').strip();limit=100
         if not 1<=len(text)<=limit:return await m.answer(f'Введите текст от 1 до {limit} символов.')
-        await sql('INSERT OR REPLACE INTO v4_settings(key,value) VALUES(?,?)',(d['setting_key'],text))
-        await audit('setting_changed');await state.clear();await m.answer('Настройка сохранена.')
+        await sql('INSERT OR REPLACE INTO v4_settings(key,value) VALUES(?,?)',('salon_name',text))
+        await state.clear();await m.answer('Настройка сохранена.')
         return await dispatch(m,uid,'v4:settings',state)
     await _input3(m,state)
 
@@ -1351,7 +1434,6 @@ async def reminders():
                 key=(b['id'],b['start'])
                 if result=='ok':
                     await sql('UPDATE bookings SET reminder=1 WHERE id=? AND start=?',key)
-                    await audit('reminder_sent',b['id'],0)
                 else:
                     await sql('INSERT OR IGNORE INTO v4_delivery(booking,start) VALUES(?,?)',key)
                     if result!='skip':await sql('UPDATE v4_delivery SET attempts=attempts+1 WHERE booking=? AND start=?',key)
@@ -1363,7 +1445,6 @@ async def reminders():
                             if alert=='ok':await sql('UPDATE v4_delivery SET alerted=1 WHERE booking=? AND start=?',key)
                         if r['alerted'] or alert=='ok':
                             await sql('UPDATE bookings SET reminder=1 WHERE id=? AND start=?',key)
-                            await audit('reminder_failed',b['id'],0)
                 await asyncio.sleep(.1)
         except Exception as e:logging.error('Reminder loop: %s',type(e).__name__)
         await asyncio.sleep(30)
@@ -1403,7 +1484,7 @@ async def pf_permission(uid, mid, edit=False):
     if not p:
         raise ValueError('Мастер не найден.')
     if edit:
-        if uid != MANAGER and not (uid == mid and p['enabled']):
+        if uid not in MANAGERS and not (uid == mid and p['enabled']):
             raise ValueError('Нет доступа к управлению портфолио.')
     elif not p['enabled']:
         raise ValueError('Портфолио этого мастера недоступно.')
@@ -1421,22 +1502,6 @@ async def master_card(m, mid):
     await m.answer('Работы мастера:', reply_markup=kb([
         [('Портфолио мастера', f'pf:edit:{mid}:0')]
     ]))
-
-async def select_masters(m, state, manual=False):
-    await state.clear()
-    await state.update_data(manual=manual)
-    items = []
-    for p in await sql('SELECT * FROM masters WHERE enabled=1 ORDER BY name'):
-        if all(await ready(p['id'])):
-            items.append(p)
-    if not items:
-        return await m.answer('Пока нет мастеров, готовых к записи.', reply_markup=kb([[('Главное меню','home')]]))
-    for i in range(0, len(items), 15):
-        rows = []
-        for p in items[i:i+15]:
-            rows.append([(p['name'], f"master:{p['id']}")])
-            rows.append([('Портфолио мастера', f"pf:view:{p['id']}:0")])
-        await m.answer('Выберите мастера. Под каждым именем — его портфолио:', reply_markup=kb(rows))
 
 async def select_services(m, state, mid):
     await _pf_services(m, state, mid)
@@ -1466,7 +1531,7 @@ async def pf_show(m, uid, mid, page=0, edit=False):
         # Managers may remove any work; only an enabled owner uploads.
         if uid == mid and p['enabled']:
             rows.append([('Добавить фото', f'pf:add:{mid}')])
-        rows.append([('Назад', f'v3:master:{mid}' if uid==MANAGER else 'staff')])
+        rows.append([('Назад', f'v3:master:{mid}' if uid in MANAGERS else 'staff')])
     else:
         rows.append([('Выбрать этого мастера', f'master:{mid}')])
         rows.append([('Вернуться к записи', f'pf:return:{mid}')])
@@ -1492,10 +1557,9 @@ async def pf_delete(m, uid, state, nonce):
         r = await (await c.execute('SELECT p.*,m.enabled FROM v4_portfolio p JOIN masters m ON m.id=p.master WHERE p.id=?', (pending['id'],))).fetchone()
         if not r:
             raise ValueError('Фотография уже удалена.')
-        if uid != MANAGER and not (uid == r['master'] and r['enabled']):
+        if uid not in MANAGERS and not (uid == r['master'] and r['enabled']):
             raise ValueError('Нет прав на удаление.')
         await c.execute('DELETE FROM v4_portfolio WHERE id=?', (r['id'],))
-        await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)', (ts(),uid,'portfolio_deleted',r['id']))
         await c.commit()
     await state.update_data(pf_delete=None)
     await m.answer('Фото удалено из портфолио. Ранее отправленные сообщения и резервные копии автоматически не удаляются.')
@@ -1575,7 +1639,6 @@ async def portfolio_input(m:Message, state:FSMContext):
             if count >= PF_LIMIT:
                 raise ValueError('Достигнут лимит 30 фото. Сначала удалите ненужное.')
             cur = await c.execute('INSERT INTO v4_portfolio(master,file_id,file_unique_id,caption,created) VALUES(?,?,?,?,?)',(uid,photo.file_id,photo.file_unique_id,caption,ts()))
-            await c.execute('INSERT INTO v4_audit(at,actor,event,object_id) VALUES(?,?,?,?)',(ts(),uid,'portfolio_added',cur.lastrowid))
             await c.commit()
         await m.answer(f'Фото сохранено ({count+1}/{PF_LIMIT}). Отправьте следующее или нажмите «Готово».', reply_markup=kb([[('Готово',f'pf:edit:{uid}:0')]]))
     except (ValueError,OverflowError) as e:
