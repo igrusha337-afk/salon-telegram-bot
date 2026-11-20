@@ -1564,7 +1564,8 @@ async def select_services(m, state, mid):
     await _pf_services(m, state, mid)
     if not (await state.get_data()).get('manual') and await master(mid):
         await m.answer('Перед выбором услуги можно посмотреть работы:', reply_markup=kb([
-            [('Портфолио мастера', f'pf:view:{mid}:0')]
+            [('Портфолио мастера', f'pf:view:{mid}:0')],
+            [('Вернуться назад', 'book')]
         ]))
 
 async def pf_show(m, uid, mid, page=0, edit=False):
