@@ -1532,7 +1532,6 @@ class PortfolioForm(StatesGroup):
 
 _pf_initialize = initialize
 _pf_dispatch = dispatch
-_pf_cabinet = cabinet
 _pf_master_card = master_card
 _pf_services = select_services
 _pf_back = back
@@ -1570,14 +1569,6 @@ async def pf_permission(uid, mid, edit=False):
         raise ValueError('Портфолио этого мастера недоступно.')
     return p
 
-async def cabinet(m, uid, state, kind):
-    await _pf_cabinet(m, uid, state, kind)
-    if kind == 'staff' and await master(uid):
-        await m.answer('Фото и портфолио:', reply_markup=kb([
-            [('Моё фото','profilephoto:menu')],
-            [('Моё портфолио', f'pf:edit:{uid}:0')]
-        ]))
-
 async def master_card(m, mid):
     await _pf_master_card(m, mid)
     await m.answer('Работы мастера:', reply_markup=kb([
@@ -1613,7 +1604,7 @@ async def pf_show(m, uid, mid, page=0, edit=False):
         # Managers may remove any work; only an enabled owner uploads.
         if uid == mid and p['enabled']:
             rows.append([('Добавить фото', f'pf:add:{mid}')])
-        rows.append([('Назад', f'v3:master:{mid}' if uid in MANAGERS else 'staff')])
+        rows.append([('Назад', 'profile' if uid==mid and p['enabled'] else f'v3:master:{mid}')])
     else:
         rows.append([('Выбрать этого мастера', f'master:{mid}')])
         rows.append([('Вернуться к записи', f'pf:return:{mid}')])
@@ -1681,7 +1672,7 @@ async def master_profile_menu(m, uid, state):
         raise ValueError('Нет прав мастера.')
     await state.clear()
     rows=[[(label,f'profilefield:edit:{field}')] for field,(label,_) in PROFILE_FIELDS.items()]
-    rows.extend([[('Моё фото','profilephoto:menu')],[('В кабинет','staff')]])
+    rows.extend([[('Моё фото','profilephoto:menu')],[('Моё портфолио',f'pf:edit:{uid}:0')],[('В кабинет','staff')]])
     await show_master_profile(m,profile,kb(rows))
 
 
@@ -1701,7 +1692,7 @@ async def profile_photo_menu(m, uid):
     rows=[[('Заменить фото' if photo else 'Добавить фото','profilephoto:add')]]
     if photo:
         rows.append([('Удалить фото','profilephoto:delete')])
-    rows.append([('В кабинет','staff')])
+    rows.append([('К профилю','profile')])
     if photo:
         try:
             return await m.answer_photo(photo['file_id'],caption='Моё фото',reply_markup=kb(rows))
