@@ -299,6 +299,7 @@ async def target_menu(m,state,uid,target):
     text='Интервалы: '+('; '.join(f'{a}–{b} / {s} мин' for a,b,s in ws) or 'не заданы')
     if target.startswith('d:') and not r:text='Используется недельный график. Добавление создаст отдельный график этой даты.'
     rows=[[('Добавить интервал','interval_add')],[('Сделать выходным','off')]]
+    if ws:rows.append([('Указать перерыв','break_add')])
     for i,w in enumerate(ws):rows.append([(f'Удалить {w[0]}–{w[1]}',f'interval_del:{i}')])
     if target.startswith('w:') and ws:rows.append([('Копировать на другой день',f'v3:copyweek:{target[2:]}')])
     if target.startswith('d:'):rows.append([('Вернуть недельный график','reset')])
@@ -310,7 +311,8 @@ async def clock(m,state,which):
     for minute in range(0,1440,30):
         label=f'{minute//60:02d}:{minute%60:02d}';cells.append((label,'clock:'+label))
         if len(cells)==4:rows.append(cells);cells=[]
-    await m.answer(('Начало' if which=='start' else 'Конец')+' интервала: выберите кнопку или введите ЧЧ:ММ. Смена должна закончиться до полуночи.',reply_markup=kb(rows))
+    subject='перерыва' if (await state.get_data()).get('schedule_break') else 'интервала'
+    await m.answer(('Начало' if which=='start' else 'Конец')+f' {subject}: выберите кнопку или введите ЧЧ:ММ. Смена должна закончиться до полуночи.',reply_markup=kb(rows))
 async def clock_value(m,state,value):
     if not re.fullmatch(r'\d{2}:\d{2}',value):raise ValueError('Введите время ЧЧ:ММ.')
     t=time.fromisoformat(value);d=await state.get_data()
@@ -318,11 +320,53 @@ async def clock_value(m,state,value):
         await state.update_data(start=value);return await clock(m,state,'end')
     if value<=d['start']:raise ValueError('Конец должен быть позже начала в тот же день.')
     await state.update_data(end=value);await state.set_state(None)
+    if d.get('schedule_break'):
+        nonce=secrets.token_hex(6)
+        await state.update_data(action='break_confirm',break_nonce=nonce)
+        return await m.answer(
+            f"Добавить перерыв {d['start']}–{value}? Существующие записи сохранятся.",
+            reply_markup=kb([[('Подтвердить',f'break_save:{nonce}')],[('Отмена','schedule')]]),
+        )
     if d.get('block'):
         await state.update_data(action='block_confirm')
         return await m.answer(f"Закрыть {d['day']} {d['start']}–{value}? Существующие записи не отменяются.",reply_markup=kb([[('Закрыть','block_save')],[('Отмена','schedule')]]))
     await state.update_data(action='step')
     await m.answer('Шаг начала записей. Ко времени окончания интервала визит должен завершиться:',reply_markup=kb([[(f'{n} мин',f'step:{n}') for n in (5,10,15)],[(f'{n} мин',f'step:{n}') for n in (20,30,60)]]))
+def subtract_schedule_break(work, start, end):
+    for index, (left, right, step) in enumerate(work):
+        if left<=start<end<=right and (left,right)!=(start,end):
+            remaining=[]
+            if left<start:
+                remaining.append([left,start,step])
+            if end<right:
+                remaining.append([end,right,step])
+            return work[:index]+remaining+work[index+1:]
+    raise ValueError('Перерыв должен находиться внутри одного рабочего интервала. Для закрытия всего интервала удалите его.')
+
+
+async def save_schedule_break(m, uid, state, data):
+    target=data['target']
+    try:
+        async with aiosqlite.connect(DB,timeout=30) as c:
+            await c.execute('BEGIN IMMEDIATE')
+            enabled=await (await c.execute('SELECT enabled FROM masters WHERE id=?',(uid,))).fetchone()
+            if not enabled or not enabled[0]:
+                raise ValueError('Нет прав мастера.')
+            row=await (await c.execute('SELECT intervals FROM v2_schedule WHERE master=? AND target=?',(uid,target))).fetchone()
+            if not row or row[0]!=data['break_snapshot']:
+                raise ValueError('График изменился. Укажите перерыв заново.')
+            work=subtract_schedule_break(unpack(row[0]),data['start'],data['end'])
+            await c.execute('UPDATE v2_schedule SET intervals=? WHERE master=? AND target=?',
+                            (json.dumps(work),uid,target))
+            await c.commit()
+    except ValueError as exc:
+        await m.answer(str(exc))
+        return await target_menu(m,state,uid,target)
+    await m.answer('Перерыв добавлен.')
+    await target_menu(m,state,uid,target)
+    await conflicts(m,uid)
+
+
 async def conflicts(m,uid):
     rows=await sql("SELECT * FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND end>?",(uid,ts()));bad=[]
     async with aiosqlite.connect(DB) as c:
@@ -469,6 +513,16 @@ async def dispatch(m,uid,k,state):
         return
     if k.startswith('unblock:'):
         await sql('DELETE FROM v2_blocks WHERE id=? AND master=?',(int(k.split(':')[1]),uid));return await m.answer('Интервал открыт.')
+    if k=='break_add':
+        if d.get('action')!='target':raise ValueError('Откройте день заново.')
+        row=await sql('SELECT intervals FROM v2_schedule WHERE master=? AND target=?',(uid,d['target']),True)
+        if not row or not unpack(row['intervals']):raise ValueError('Сначала задайте рабочий интервал.')
+        await state.update_data(schedule_break=True,break_snapshot=row['intervals'])
+        return await clock(m,state,'start')
+    if k.startswith('break_save:'):
+        if d.get('action')!='break_confirm' or d.get('break_nonce')!=k.split(':')[1]:
+            raise ValueError('Подтверждение устарело.')
+        return await save_schedule_break(m,uid,state,d)
     if k=='interval_add':
         if d.get('action')!='target':raise ValueError('Откройте день заново.')
         await state.update_data(block=False);return await clock(m,state,'start')
@@ -773,7 +827,7 @@ async def back(m,uid,state):
     if a=='name' or (a=='confirm' and d.get('move')):return await dates(m,state)
     if a=='date' and d.get('mid') and not d.get('move'):return await select_services(m,state,d['mid'])
     if a=='clock' and d.get('which')=='end':return await clock(m,state,'start')
-    if a in ('clock','step','target','block_confirm','schedule_date','block_date') and await master(uid):return await schedule_menu(m,state,uid)
+    if a in ('clock','step','target','block_confirm','break_confirm','schedule_date','block_date') and await master(uid):return await schedule_menu(m,state,uid)
     if uid in MANAGERS:return await cabinet(m,uid,state,'manager')
     if await master(uid):return await cabinet(m,uid,state,'staff')
     return await home(m,uid,state)
