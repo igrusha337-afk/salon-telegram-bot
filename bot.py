@@ -266,9 +266,9 @@ async def save(uid,d):
 async def listing(m,uid,scope,period):
     if scope=='manager' and uid not in MANAGERS:return
     if scope=='staff' and not await master(uid):return
-    base='SELECT b.*,m.name AS master_name FROM bookings b JOIN masters m ON m.id=b.master WHERE '
-    if scope=='client':q=base+"b.client=? AND b.status='active' AND b.start>?"; args=[uid,ts()]
-    elif period=='all':q=base+"b.status='active' AND b.start>?";args=[ts()]
+    base="SELECT b.*,m.name AS master_name FROM bookings b JOIN masters m ON m.id=b.master WHERE b.status='active' AND "
+    if scope=='client':q=base+"b.client=? AND b.visit_state='expected' AND b.start>?"; args=[uid,ts()]
+    elif period=='all':q=base+"b.visit_state='expected' AND b.start>?";args=[ts()]
     else:
         day=now().date()+timedelta(days=1 if period=='tomorrow' else 0)
         count={'week':7,'month':30}.get(period,1)
@@ -742,8 +742,8 @@ async def master_card(m,mid):
     p=await sql('SELECT * FROM masters WHERE id=?',(mid,),True)
     if not p:raise ValueError('Мастер не найден.')
     flags=await ready(mid)
-    count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND start>?",(mid,ts()),True)
-    near=await sql("SELECT start FROM bookings WHERE master=? AND status='active' AND start>? ORDER BY start LIMIT 1",(mid,ts()),True)
+    count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND start>?",(mid,ts()),True)
+    near=await sql("SELECT start FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND start>? ORDER BY start LIMIT 1",(mid,ts()),True)
     text=f"Мастер: {p['name'] or 'Профиль не заполнен'}\nID: {mid}\n{p['bio']}\nПрава: {'активны' if p['enabled'] else 'отозваны'}\nПредстоящих записей: {count['n']}\nБлижайшая: {fmt(near['start']) if near else 'нет'}"
     if p['enabled']:text+='\nГотовность: '+('готов к записи' if all(flags) else 'нужно завершить настройку')
     rows=[[('Записи',f'v3:masterbook:{mid}:0'),('Расписание',f'v3:masterschedule:{mid}')]]
@@ -1039,7 +1039,7 @@ async def dispatch(m,uid,k,state):
         if value not in (0,1):return
         p=await sql('SELECT * FROM masters WHERE id=?',(mid,),True)
         if not p:return
-        count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND start>?",(mid,ts()),True)
+        count=await sql("SELECT COUNT(*) AS n FROM bookings WHERE master=? AND status='active' AND visit_state='expected' AND start>?",(mid,ts()),True)
         await state.set_data(dict(action='rights',mid=mid,value=value,old=p['enabled'],nonce=secrets.token_hex(6)))
         d=await state.get_data()
         return await m.answer(('Восстановить' if value else 'Отозвать')+f" права мастера {p['name'] or mid}?\nПредстоящих записей: {count['n']}. Они останутся у управляющего. Профиль, услуги и история сохранятся. Клиентские функции останутся доступны.",reply_markup=kb([[('Подтвердить','v3:rightok:'+d['nonce'])],[('Назад',f'v3:master:{mid}')]]))
