@@ -1311,13 +1311,25 @@ async def home(m,uid,state):
             logging.warning('Salon welcome photo unavailable')
     await _home3(m,uid,state)
     name=await setting('salon_name');contact=await setting('admin_contact')
-    links=await sql('SELECT label,url FROM v4_salon_links ORDER BY id')
+    links=await sql('SELECT id,label,url FROM v4_salon_links ORDER BY id')
     if name or contact or links:
         text='\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x)
         markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=link['label'],url=link['url'])] for link in links
         ]) if links else None
-        await m.answer(text or 'Ссылки салона',reply_markup=markup)
+        try:
+            await m.answer(text or 'Ссылки салона',reply_markup=markup)
+        except TelegramBadRequest:
+            if not links:
+                raise
+            await m.answer(text or 'Ссылки салона')
+            for link in links:
+                try:
+                    await m.answer('Ссылка салона',reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=link['label'],url=link['url'])]
+                    ]))
+                except TelegramBadRequest:
+                    logging.warning('Telegram rejected salon link id %s',link['id'])
 
 async def cabinet(m,uid,state,kind):
     await _cabinet3(m,uid,state,kind)
@@ -1668,6 +1680,12 @@ async def input_v4(m:Message,state:FSMContext):
             return await m.answer('Отправьте полный адрес, например https://vk.com/salon.',reply_markup=kb([[('Отмена','salonlink:list')]]))
         if not valid_salon_url(text):
             return await m.answer('Введите полный адрес, начинающийся с https:// или http://.')
+        try:
+            await m.answer('Проверка кнопки:',reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=d['link_label'],url=text)]
+            ]))
+        except TelegramBadRequest:
+            return await m.answer('Telegram не принимает этот адрес для кнопки. Отправьте другую полную ссылку с https://.')
         if d['link_id'] is None:
             saved=await sql(
                 'INSERT INTO v4_salon_links(label,url) SELECT ?,? '
