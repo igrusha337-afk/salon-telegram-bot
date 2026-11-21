@@ -674,7 +674,7 @@ async def ready(mid):
     schedule=any(unpack(r['intervals']) and (r['target'].startswith('w:') or r['target'][2:]>=now().date().isoformat()) for r in rows)
     return bool(p['name'].strip()),bool(service),schedule
 
-async def home(m,uid,state):
+async def home(m,uid,state,contacts='',links=()):
     await state.clear()
     p=await master(uid)
     title='CRM Салона' if p or uid in MANAGERS else 'Запись к мастеру'
@@ -682,7 +682,24 @@ async def home(m,uid,state):
     rows=[[('Записаться','book'),('Мои записи','my')]]
     if p:rows.append([('Кабинет мастера','staff')])
     if uid in MANAGERS:rows.append([('Управление салоном','manager')])
-    await m.answer('Выберите действие:',reply_markup=kb(rows))
+    if contacts:
+        await m.answer(contacts)
+    markup=kb(rows)
+    link_rows=[[InlineKeyboardButton(text=link['label'],url=link['url'])] for link in links]
+    text='Наши контакты' if links else 'Выберите действие:'
+    try:
+        await m.answer(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=markup.inline_keyboard+link_rows))
+    except TelegramBadRequest:
+        if not links:
+            raise
+        panel=await m.answer(text,reply_markup=markup)
+        accepted=list(markup.inline_keyboard)
+        for link,row in zip(links,link_rows):
+            try:
+                await panel.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=accepted+[row]))
+                accepted.append(row)
+            except TelegramBadRequest:
+                logging.warning('Telegram rejected salon link id %s',link['id'])
 
 async def select_masters(m,state,manual=False):
     await state.clear();await state.update_data(manual=manual)
@@ -1309,27 +1326,10 @@ async def home(m,uid,state):
             await m.answer_photo(banner['value'])
         except TelegramBadRequest:
             logging.warning('Salon welcome photo unavailable')
-    await _home3(m,uid,state)
     name=await setting('salon_name');contact=await setting('admin_contact')
+    contacts='\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x)
     links=await sql('SELECT id,label,url FROM v4_salon_links ORDER BY id')
-    if name or contact or links:
-        text='\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x)
-        markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=link['label'],url=link['url'])] for link in links
-        ]) if links else None
-        try:
-            await m.answer(text or 'Ссылки салона',reply_markup=markup)
-        except TelegramBadRequest:
-            if not links:
-                raise
-            await m.answer(text or 'Ссылки салона')
-            for link in links:
-                try:
-                    await m.answer('Ссылка салона',reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text=link['label'],url=link['url'])]
-                    ]))
-                except TelegramBadRequest:
-                    logging.warning('Telegram rejected salon link id %s',link['id'])
+    await _home3(m,uid,state,contacts,links)
 
 async def cabinet(m,uid,state,kind):
     await _cabinet3(m,uid,state,kind)
