@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
@@ -1219,6 +1220,11 @@ async def initialize():
     async with aiosqlite.connect(DB,timeout=30) as c:
         await c.executescript("""
         CREATE TABLE IF NOT EXISTS v4_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS v4_salon_links(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            url TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS v4_contacts(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             contact TEXT NOT NULL
@@ -1297,9 +1303,21 @@ async def send_booking_recipient(uid,b,text,markup=None):
     return await send_staff(uid,text,markup)
 
 async def home(m,uid,state):
+    banner=await sql("SELECT value FROM v4_settings WHERE key='welcome_photo'",one=True)
+    if banner:
+        try:
+            await m.answer_photo(banner['value'])
+        except TelegramBadRequest:
+            logging.warning('Salon welcome photo unavailable')
     await _home3(m,uid,state)
     name=await setting('salon_name');contact=await setting('admin_contact')
-    if name or contact:await m.answer('\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x))
+    links=await sql('SELECT label,url FROM v4_salon_links ORDER BY id')
+    if name or contact or links:
+        text='\n'.join(x for x in [name,'Администратор: '+contact if contact else ''] if x)
+        markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=link['label'],url=link['url'])] for link in links
+        ]) if links else None
+        await m.answer(text or 'Ссылки салона',reply_markup=markup)
 
 async def cabinet(m,uid,state,kind):
     await _cabinet3(m,uid,state,kind)
@@ -1445,6 +1463,53 @@ async def contact_menu(m, page=0):
     await m.answer('Сейчас отображается: ' + (active or 'контакт не выбран'), reply_markup=kb(rows))
 
 
+async def salon_links_menu(m, state):
+    await state.clear()
+    links=await sql('SELECT id,label FROM v4_salon_links ORDER BY id')
+    rows=[[(link['label'],f"salonlink:open:{link['id']}")] for link in links]
+    if len(links)<10:
+        rows.append([('Добавить кнопку','salonlink:add')])
+    rows.append([('К настройкам','v4:settings')])
+    await m.answer('Ссылки салона. Можно настроить до 10 кнопок.',reply_markup=kb(rows))
+
+
+async def manage_salon_link(m, state, key):
+    action,_,value=key.removeprefix('salonlink:').partition(':')
+    if action=='list':
+        return await salon_links_menu(m,state)
+    if action=='add':
+        return await prompt(m,state,'salon_link_label','Введите название кнопки, например «Наш сайт» или «VK».',link_id=None)
+    link_id=int(value)
+    link=await sql('SELECT label,url FROM v4_salon_links WHERE id=?',(link_id,),True)
+    if not link:
+        return await salon_links_menu(m,state)
+    if action=='edit':
+        return await prompt(m,state,'salon_link_label','Введите новое название кнопки.',link_id=link_id)
+    if action=='confirm':
+        await sql('DELETE FROM v4_salon_links WHERE id=?',(link_id,))
+        return await salon_links_menu(m,state)
+    await state.clear()
+    if action=='delete':
+        return await m.answer(f"Удалить кнопку «{link['label']}»?",reply_markup=kb([
+            [('Да, удалить',f'salonlink:confirm:{link_id}')],[('Отмена','salonlink:list')]
+        ]))
+    if action=='open':
+        return await m.answer(f"{link['label']}\n{link['url']}",reply_markup=kb([
+            [('Редактировать',f'salonlink:edit:{link_id}'),('Удалить',f'salonlink:delete:{link_id}')],
+            [('К списку','salonlink:list')]
+        ]))
+
+
+def valid_salon_url(url):
+    if not url or len(url)>2048 or any(ch.isspace() for ch in url) or '\\' in url or any(ord(ch)<32 or ord(ch)==127 for ch in url):
+        return False
+    try:
+        parsed=urlsplit(url)
+        return parsed.scheme in ('http','https') and bool(parsed.hostname) and parsed.username is None and parsed.password is None and (parsed.port is None or parsed.port>0)
+    except ValueError:
+        return False
+
+
 async def manage_contact(m, state, key):
     action, _, value = key.removeprefix('v4:contact:').partition(':')
     if action == 'add':
@@ -1491,7 +1556,27 @@ async def dispatch(m,uid,k,state):
         return await prompt(m,state,'search','Введите имя или часть телефона (без учёта регистра, скобок, пробелов и дефисов):')
     if k=='v4:settings':
         if uid not in MANAGERS:return
-        return await m.answer('Настройки салона:',reply_markup=kb([[('Название','v4:setting:salon_name')],[('Контакт администратора','v4:setting:admin_contact')],[('Управление','manager')]]))
+        return await m.answer('Настройки салона:',reply_markup=kb([[('Название','v4:setting:salon_name')],[('Контакт администратора','v4:setting:admin_contact')],[('Ссылки','salonlink:list')],[('Приветственное фото','welcomephoto:menu')],[('Управление','manager')]]))
+    if k.startswith('welcomephoto:'):
+        if uid not in MANAGERS:return
+        if k=='welcomephoto:add':
+            return await prompt(m,state,'welcome_photo_upload','Отправьте приветственный баннер как фото.')
+        if k=='welcomephoto:delete':
+            await state.set_state(None)
+            nonce=secrets.token_hex(6)
+            await state.set_data(dict(welcome_photo_delete=nonce))
+            return await m.answer('Удалить приветственное фото?',reply_markup=kb([
+                [('Да, удалить',f'welcomephoto:confirm:{nonce}')],[('Отмена','welcomephoto:menu')]
+            ]))
+        if k.startswith('welcomephoto:confirm:'):
+            if (await state.get_data()).get('welcome_photo_delete')!=k.rsplit(':',1)[-1]:
+                raise ValueError('Подтверждение устарело.')
+            await sql("DELETE FROM v4_settings WHERE key='welcome_photo'")
+        await state.clear()
+        return await welcome_photo_menu(m)
+    if k.startswith('salonlink:'):
+        if uid not in MANAGERS:return
+        return await manage_salon_link(m,state,k)
     if k=='v4:setting:admin_contact' or k.startswith('v4:contact:'):
         if uid not in MANAGERS:return
         if k=='v4:setting:admin_contact':
@@ -1530,8 +1615,29 @@ async def start_v4(m:Message,state:FSMContext):
         return await link_start(m,state,parts[1][5:])
     await home(m,m.from_user.id,state)
 
+async def welcome_photo_menu(m):
+    banner=await sql("SELECT value FROM v4_settings WHERE key='welcome_photo'",one=True)
+    rows=[[('Заменить фото' if banner else 'Добавить фото','welcomephoto:add')]]
+    if banner:
+        rows.append([('Удалить фото','welcomephoto:delete')])
+    rows.append([('К настройкам','v4:settings')])
+    if banner:
+        try:
+            return await m.answer_photo(banner['value'],caption='Приветственное фото',reply_markup=kb(rows))
+        except TelegramBadRequest:
+            pass
+    await m.answer('Приветственное фото',reply_markup=kb(rows))
+
+
 async def input_v4(m:Message,state:FSMContext):
     d=await state.get_data();uid=m.from_user.id
+    if d.get('action')=='welcome_photo_upload':
+        if uid not in MANAGERS:return
+        if not m.photo:
+            return await m.answer('Отправьте баннер как фото, а не как файл.')
+        await sql("INSERT OR REPLACE INTO v4_settings(key,value) VALUES('welcome_photo',?)",(m.photo[-1].file_id,))
+        await state.clear()
+        return await welcome_photo_menu(m)
     if d.get('action')=='profile_field':
         text=(m.text or '').strip()
         if not text:
@@ -1552,6 +1658,27 @@ async def input_v4(m:Message,state:FSMContext):
         if not saved:
             return await m.answer('Нет прав мастера.')
         return await profile_photo_menu(m,uid)
+    if d.get('action') in ('salon_link_label','salon_link_url'):
+        if uid not in MANAGERS:return
+        text=(m.text or '').strip()
+        if d['action']=='salon_link_label':
+            if not 1<=len(text)<=64 or len(text.splitlines())!=1:
+                return await m.answer('Введите название одной строкой, до 64 символов.')
+            await state.update_data(action='salon_link_url',link_label=text)
+            return await m.answer('Отправьте полный адрес, например https://vk.com/salon.',reply_markup=kb([[('Отмена','salonlink:list')]]))
+        if not valid_salon_url(text):
+            return await m.answer('Введите полный адрес, начинающийся с https:// или http://.')
+        if d['link_id'] is None:
+            saved=await sql(
+                'INSERT INTO v4_salon_links(label,url) SELECT ?,? '
+                'WHERE (SELECT COUNT(*) FROM v4_salon_links)<10 RETURNING id',
+                (d['link_label'],text),True,
+            )
+        else:
+            saved=await sql('UPDATE v4_salon_links SET label=?,url=? WHERE id=? RETURNING id',
+                            (d['link_label'],text,d['link_id']),True)
+        await m.answer('Кнопка сохранена.' if saved else 'Список изменился. Откройте его заново.')
+        return await salon_links_menu(m,state)
     if d.get('action')=='v4_contact_add':
         if uid not in MANAGERS:return
         text=(m.text or '').strip()
